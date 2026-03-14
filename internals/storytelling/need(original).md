@@ -1,0 +1,12 @@
+need: 
+- a dynamic evolving md filetype for agents to keep context/report etc. something more than just read/write…and without instructions, updating the md as agent evolves
+- md timeline trace, for a single big task, multiple agents can work, but only the user knows the context of the md files, md file trace basically
+- better templating for agent to follow context
+- have ‘mental model’ mds, which are then derived by skills.md
+- for ~500 line report, no instruction file can capture nuances as such, so need fingerprint scanner types analysis
+- persistent and non-persistent artifacts principle
+- how to solve stale data in md files
+- auto updating amd files on every chat thread (biggest developer painpoint)
+- heavy timeseries based data
+- setting updating priority
+- ’caveats’ rules
