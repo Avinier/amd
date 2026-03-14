@@ -58,6 +58,7 @@ AMD v2 should be designed as if these flaws are the starting constraints.
 
 AMD v2 should be:
 
+- **Agent-native CLI** — the primary interface is for AI agents (Claude Code, Codex, etc.) invoking commands at machine speed; humans can use it, but agents are the first-class consumers
 - **Git-native**
 - **Markdown-first**
 - **Index-backed**
@@ -65,6 +66,7 @@ AMD v2 should be:
 - **Provenance-rich**
 - **Derivation-capable**
 - **Safe for multiple agents**
+- **Metadata-only in `.amd/`** — `.amd/` stores identity, relations, temporal data, and context signals; zero document content
 
 AMD v2 should not be:
 
@@ -73,6 +75,7 @@ AMD v2 should not be:
 - a general TSDB
 - a giant inline metadata block
 - a system that depends on agents manually maintaining changelog prose
+- a content store — `.amd/` never holds copies of user documents
 
 ## What AMD Borrows, By Source
 
@@ -674,7 +677,7 @@ hooks:
 
 ### 3. Journal Layer
 
-The concurrency-safe source of machine truth should be append-only journals in `.amd/`.
+The concurrency-safe source of machine truth should be append-only journals in `.amd/`. All `.amd/` contents are metadata — identity, relations, temporal data, context signals — never document content.
 
 Suggested layout:
 
@@ -1219,6 +1222,8 @@ Practical implication:
   - index/journal state
 
 ## Command Surface
+
+AMD is an agent-native CLI. The primary consumers are AI agents (Claude Code, Codex, etc.) that invoke these commands programmatically. Agents dynamically create artifacts, record events, query the graph, derive new documents, and rebuild structure as understanding evolves. The graph in `.amd/` is live working state, not a static archive.
 
 Suggested v2 command model:
 

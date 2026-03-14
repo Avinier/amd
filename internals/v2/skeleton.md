@@ -3,6 +3,12 @@
 This document restructures the scaffold's research into a buildable feature/requirement list.
 Each feature states: what it is, why it matters, what v1 has, and how v2 achieves it.
 
+## Foundational Constraints
+
+**`.amd/` is metadata only.** It stores identity records, relation edges, temporal data (activity journals, event logs, signal rollups), and context signals. Zero document content. The user's Markdown files live wherever the user puts them. `.amd/` only knows *about* them.
+
+**AMD is an agent-native CLI.** The primary consumers are AI agents — Claude Code, Codex, and similar — that invoke AMD commands at machine speed and volume. Agents dynamically create artifacts, record events, query the graph, derive new documents, and break/rebuild structure as understanding evolves. The graph in `.amd/` is live working state that changes every session. Humans can use the CLI directly, but the design optimizes for programmatic agent consumption.
+
 ---
 
 ## F1. Source Format: Plain Markdown With Minimal Frontmatter
@@ -626,9 +632,11 @@ AMD should be automation-friendly without becoming an automation platform. The s
 
 ## Directory Layout
 
+`.amd/` is metadata only: identity, relations, temporal data, context signals. No document content lives here.
+
 ```
 project-root/
-  .amd/
+  .amd/                                   # Metadata only — zero document content
     config.yml                          # Project defaults, kind overrides, hooks
     schemas/
       report.incident.yml               # Schema definitions
