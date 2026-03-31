@@ -1,260 +1,139 @@
-# AMD v2 Plan: Config And Schemas
+# AMD v2 Plan: Per-Artifact Config As The Single Policy Lever
 
 ## Executive Summary
 
-AMD needs both a project config and a schema system, but they should not compete with each other.
+AMD uses a two-layer config resolution model: per-artifact config files and minimal frontmatter overrides, with universal hardcoded defaults as the baseline. There is no global project config, no shared kind definitions file, and no separate schema subsystem.
 
 The clean split is:
 
-- **`.amd/config.yml`** defines how this project operates
-- **`.amd/schemas/*.yml`** define what artifact kinds mean
-- **artifact frontmatter** defines one artifact instance and its local exceptions
+- **`.amd/config/<artifact_id>.yml`** is the single authoritative policy source for each artifact — kind classification, freshness policy, signal thresholds, derive contracts, required sections, refresh mode
+- **artifact frontmatter** carries identity (`amd.id`) and rare local one-off policy overrides (`amd.policy`)
+- **AMD hardcoded defaults** provide the universal baseline when config fields are absent
 
-That gives AMD three layers with distinct ownership:
+Every artifact is different. Even two incident reports may have different staleness thresholds, different required sections, different signal streams. The per-artifact config file is the lever to fine-tune how AMD evaluates, prioritizes, and monitors each artifact's journals and signals.
 
-- project policy and runtime defaults
-- kind semantics and derivation contracts
-- instance-specific overrides
+`kind` is a classification tag, not a resolution layer. It is useful for filtering, querying, and for `amd init` to know which built-in template to seed. But it does not create a shared contract — the config file is the contract.
 
-The strongest recommendation is:
+No schemas. No global config. No `kinds.yml`. Per-artifact config plus hardcoded defaults plus SQLite covers everything.
 
-- keep `config.yml` narrow and operational
-- keep schemas as the only place that defines kind structure
-- rename config-side `kinds:` to **`kind_policy_overrides:`** if that feature exists at all
-- implement schema inheritance in AMD core, not by trying to make JSON Schema itself model class inheritance
+## Design Principle
 
-This is the best fit for AMD because MyST shows a strong project/page override pattern,[1][2] Dendron shows the value of schemas as an optional type system with template binding,[3] and the JSON Schema project explicitly notes that inheritance is not something JSON Schema can model perfectly on its own.[4][5]
+**Every artifact is its own thing.**
 
-## Key Findings
+Even artifacts of the same kind may have different staleness requirements, different signal thresholds, different required sections, and different derive contracts. A payments incident report and a search incident report may both be `report.incident` but live under completely different operational pressures.
 
-- **Project config and per-document metadata should be separate layers**: MyST distinguishes project-level configuration from page-level frontmatter and explicitly documents which fields are project-only, page-only, or page-overrides-project.[1][2]
-- **Explicit clearing matters**: MyST documents that `null` on the page can override and clear an inherited project value.[1] AMD should adopt the same behavior for overrideable policy fields.
-- **Schemas work best as an optional type system**: Dendron describes schemas as an optional type system for notes and highlights automatic template insertion as a primary capability.[3]
-- **AMD should not inherit Dendron’s path/hierarchy-centric matching as a core rule**: Dendron’s schemas are hierarchy-oriented,[3] but AMD’s design goal is arbitrary file layout. For AMD, schema selection should be kind-first, not path-first.
-- **JSON Schema is good for validation, not for AMD’s semantic inheritance rules**: JSON Schema provides meta-schemas and validation vocabularies,[4] but the JSON Schema team’s own guidance is that inheritance is not fully expressible in JSON Schema itself.[5]
-- **Configuration composition should be explicit and conservative**: MyST supports composable config files with `extends`, but its own docs warn about complexity around extended files and override behavior.[1] AMD should support a simpler, safer composition model.
-- **Typed internal models are a good implementation fit**: Pydantic can validate Python data structures and emit JSON Schema, which fits AMD’s Python codebase and gives a clean path from YAML -> validated model -> JSON Schema for docs/tests.[6][7]
+The per-artifact config file is the single place where this artifact's operational behavior is defined. The agent sets it up at creation time, adjusts it as the artifact evolves, and AMD reads it on every refresh to evaluate temporal state, signal health, and derivation drift.
 
-## Detailed Analysis
+## Kind As Classification, Not Contract
 
-### 1. The problem config and schemas solve
+### What kind is
 
-AMD needs to answer three different questions:
+`kind` is a free-form classification string stored in the per-artifact config file. It tells agents and humans what type of artifact this is. It is useful for:
 
-1. **How should this project behave by default?**
-   - freshness defaults
-   - rollup windows
-   - priority coefficients
-   - hooks
-   - runtime settings
+- filtering (`amd query --kind report.incident`)
+- display and grouping in `amd scan` and `amd agenda`
+- `amd init --kind <type>` knowing which built-in template to seed
 
-2. **What is a `report.incident` or `mental_model`?**
-   - required sections
-   - optional sections
-   - template binding
-   - ownership defaults
-   - derivation contracts
+### What kind is not
 
-3. **What is special about this one artifact instance?**
-   - local labels
-   - unusually urgent stale threshold
-   - one-off derive override
+`kind` is not a resolution layer. AMD does not look up a kind definition and apply shared defaults. The config file contains all the policy fields this artifact needs. If a field is absent from config, AMD falls through to universal hardcoded defaults — not to a kind-level definition.
 
-If AMD tries to answer all three in one file, the system gets blurry. If it splits them cleanly, resolution is straightforward.
+This means:
 
-### 2. The relation between config, schemas, and frontmatter
+- changing what "incident report" means for a project requires updating each relevant config file
+- this is an agent-native operation: the agent can query by kind and update config files in bulk
+- there is no hidden shared layer that silently changes behavior across artifacts
 
-The clean model is:
+### Kind authority
 
-- **config** = project operating environment
-- **schema** = kind definition
-- **frontmatter** = object instance
+| Surface | Role for `kind` |
+|---|---|
+| `.amd/config/<artifact_id>.yml` | **Authoritative.** AMD reads kind from here. |
+| Artifact frontmatter `amd.kind` | **Informational.** Human convenience. Doctor flags divergence. |
 
-That means they are not peers. They are layered.
+## Why No Global Config
 
-#### Project config owns
+A global `config.yml` would hold project-wide defaults for freshness, priority coefficients, signal windows, and hooks. In practice:
 
-- project-wide artifact policy defaults
-- kind-level policy overrides that are local to this project
-- runtime behavior
-- hooks
-- indexing/timeseries tuning
+- **Freshness defaults** — hardcoded defaults handle this. `tactical` / `24h` is the universal baseline. Per-artifact config overrides when needed.
+- **Priority coefficients** — No one tunes these on Day 1. Hardcode them. Add a config surface later if someone actually needs it.
+- **Signal windows and silence multiplier** — `[15m, 1h, 6h, 24h, 7d]` and `6` are sensible defaults. Hardcode them.
+- **Hooks** — No other plan references hooks. No command consumes them. Defer.
+- **Runtime tuning** — WAL mode on, sensible lock timeout. Implementation details, not user-facing config.
 
-#### Schema owns
+A global config adds a resolution layer that does not pay for itself in v2. Every value it would hold either belongs in per-artifact config or AMD core.
 
-- kind ID
-- parent kind
-- required/optional sections
-- template binding
-- ownership defaults
-- derivation contract
-- kind-level default policy
+## Why No Shared Kind Definitions
 
-#### Frontmatter owns
+Earlier iterations considered `.amd/kinds.yml` as a shared definition layer — one file defining what each kind means (required sections, freshness policy, derive contracts), resolved at refresh time so all artifacts of a kind inherit shared defaults.
 
-- instance identity
-- local metadata
-- one-off policy overrides
-- explicit `null` to clear inherited values
+This was cut because:
 
-### 3. Recommended resolution order
+- **Every artifact is different.** Even artifacts of the same kind may need different freshness thresholds, different signals, different required sections. A shared layer encourages treating same-kind artifacts as interchangeable when they are not.
+- **Per-artifact config already covers everything.** Config files are the lever. Making them depend on a shared definition adds a resolution layer without proportional benefit.
+- **Bulk kind-level changes are an agent-native operation.** "All incident reports should require a timeline section" is exactly the workflow AMD is built for: query by kind, filter, update config files. The agent handles this the same way it handles any multi-artifact propagation.
+- **One fewer resolution layer to debug.** With kinds.yml, a value could come from hardcoded defaults, kind definitions, per-artifact config, or frontmatter. Without it, the chain is: hardcoded → config/ → frontmatter. Simpler to reason about, simpler to implement.
+- **Built-in templates handle the Day 1 experience.** `amd init --kind report.incident` seeds the config file with sensible starting values. The artifact gets the right defaults at creation time without needing a live resolution layer.
 
-For effective artifact policy, the recommended order is:
+## Per-Artifact Config
 
-1. project config defaults
-2. resolved parent schema policy
-3. resolved child schema policy
-4. project `kind_policy_overrides`
-5. artifact frontmatter override
+### What it is
 
-Rule:
+`.amd/config/<artifact_id>.yml` is the single authoritative policy source for each artifact. It follows the same per-artifact keying pattern as `journal/` and `signals/`. It defines how AMD evaluates, monitors, and prioritizes this artifact.
 
-- later layers override earlier ones
-- explicit `null` clears an inherited value when that field is nullable
+### What it contains
 
-This matches the spirit of MyST’s project/page override behavior,[1][2] while preserving schema portability across projects.
+A config file defines the full operational policy for this artifact. `amd init --kind <type>` seeds it with built-in template values, then the agent or user adjusts as needed.
 
-### 4. What should live in `.amd/config.yml`
-
-`config.yml` should contain project-scoped concerns only.
-
-Recommended categories:
-
-- `version`
-- `extends`
-- `artifact_policy_defaults`
-- `kind_policy_overrides`
-- `priority`
-- `signals`
-- `runtime`
-- `hooks`
-
-#### Recommended shape
+A typical config file after `amd init --kind report.incident`:
 
 ```yaml
-version: 1
+kind: report.incident
+freshness_class: observational
+stale_after: 4h
+refresh_mode: auto
 
-extends:
-  - ./base.amd.yml
+required_sections:
+  - executive-summary
+  - current-context
+  - risk-assessment
+  - caveats
 
-artifact_policy_defaults:
-  freshness_class: tactical
-  stale_after: 24h
-  refresh_mode: auto
-
-kind_policy_overrides:
-  report.incident:
-    freshness_class: observational
-    stale_after: 4h
-  mental_model:
-    freshness_class: foundational
-    stale_after: 168h
-
-priority:
-  manual_baseline: 50
-  coefficients:
-    freshness: 10
-    caveat: 5
-    signal_warn: 10
-    signal_critical: 20
-    derivation_drift: 10
-
-signals:
-  windows: [15m, 1h, 6h, 24h, 7d]
-  silence_multiplier: 6
-
-runtime:
-  lock_timeout: 5s
-  sqlite:
-    wal: true
-
-hooks:
-  pre_refresh: scripts/pre_refresh.py
-  post_refresh: scripts/post_refresh.sh
-  post_derive: scripts/post_derive.py
+optional_sections:
+  - timeline
+  - affected-services
+  - appendices
 ```
 
-#### Why not `defaults: ... priority: ... timeseries: ...` all mixed together
-
-Because some config is inherited artifact policy and some is engine/runtime tuning.
-
-These are not the same thing:
-
-- `stale_after` is inherited artifact policy
-- `signals.windows` is engine rollup configuration
-- `hooks.post_refresh` is runtime behavior
-
-Grouping them separately makes resolution and reasoning much cleaner.
-
-### 5. What should not live in `config.yml`
-
-Do **not** put these in project config:
-
-- required sections
-- optional sections
-- template path for a kind
-- derive section mappings
-- ownership rules for one kind
-
-Those are schema concerns.
-
-This is why `kinds:` is the wrong name if it contains anything beyond policy overrides. It sounds like a second schema registry.
-
-Recommendation:
-
-- use `kind_policy_overrides:` instead of `kinds:`
-
-### 6. What should live in schema files
-
-Schemas should define kind semantics only.
-
-Recommended schema fields:
-
-- `version`
-- `id`
-- `title`
-- `description`
-- `parent`
-- `template`
-- `sections`
-- `ownership`
-- `policy`
-- `derive`
-
-#### Recommended shape
+A config file for an artifact with signal tracking and derive contracts:
 
 ```yaml
-version: 1
-id: report.incident
-title: Incident Report
-parent: report
+kind: report.incident
+freshness_class: observational
+stale_after: 2h
 
-template: templates/report.incident.md
+required_sections:
+  - executive-summary
+  - current-context
+  - risk-assessment
+  - caveats
+  - affected-services
 
-sections:
-  required:
-    - executive-summary
-    - current-context
-    - risk-assessment
-    - caveats
-  optional:
-    - timeline
-    - affected-services
-    - appendices
-
-ownership:
-  default: user
-  generated: []
-  mixed: []
-
-policy:
-  freshness_class: observational
-  stale_after: 4h
+signals:
+  error_rate:
+    expected_cadence: 5m
+    thresholds:
+      warn: 0.05
+      critical: 0.10
+  response_time_p99:
+    expected_cadence: 5m
+    thresholds:
+      warn: 500
+      critical: 1000
 
 derive:
   targets:
     report.postmortem:
-      ownership: generated
       mappings:
         - from: executive-summary
           to: incident-summary
@@ -264,251 +143,249 @@ derive:
           to: timeline-of-events
 ```
 
-### 7. Schema inheritance
+### Fields
 
-AMD should support parent-child schema inheritance, but the inheritance semantics should be **AMD-owned**, not delegated to JSON Schema inheritance tricks.
+- `kind` — the artifact kind (e.g. `report.incident`, `mental_model`, `runbook`). Free-form string, namespaced by convention. Used for filtering and querying. **This is the authoritative kind assignment for this artifact.**
+- `freshness_class` — one of `observational`, `tactical`, `foundational`. Determines how aggressively the artifact decays. Falls through to hardcoded default (`tactical`) if absent.
+- `stale_after` — duration string (e.g. `4h`, `24h`, `168h`). The staleness threshold. Falls through to hardcoded default (`86400` / 24h) if absent.
+- `refresh_mode` — one of `auto`, `manual`, `frozen`, `live`. Controls which refresh steps apply. Falls through to hardcoded default (`auto`) if absent.
+- `required_sections` — list of section labels that `amd doctor` checks for. Falls through to hardcoded default (`[]`) if absent.
+- `optional_sections` — list of section labels that are recognized but not required. Falls through to hardcoded default (`[]`) if absent.
+- `signals` — map of metric definitions. Each metric has:
+  - `expected_cadence` — how often AMD should expect new signal points
+  - `thresholds` — `warn` and `critical` numeric boundaries for breach detection
+- `derive` — derivation contracts for this artifact as a source.
+  - `targets` — map keyed by target kind. Each target has:
+    - `mappings` — list of `{ from, to }` section label pairs defining the transform contract
 
-Recommended behavior:
+All fields are optional. Absent fields fall through to universal hardcoded defaults. The config file only needs the fields this artifact cares about.
 
-- parent and child schemas are both validated structurally
-- AMD resolves the inheritance graph in application logic
-- the resolved schema is then used for doctor/init/derive
+### How section validation works
 
-#### Recommended merge rules
+`amd doctor` validates sections using the config file and the SQLite section tree:
 
-- scalar fields
-  - child overrides parent
-- map/object fields
-  - deep-merge
-- `sections.required`
-  - additive union, preserving order
-- `sections.optional`
-  - additive union, preserving order
-- `ownership`
-  - child overrides or extends by bucket
-- `derive.targets`
-  - child can add new targets or override an existing target spec by target kind
+1. Read `required_sections` from `.amd/config/<artifact_id>.yml` (empty list if absent)
+2. Query the `sections` table in SQLite for all sections belonging to this artifact
+3. Compare: for each required label, check if a section with that label exists
+4. Report missing required sections as errors
+5. Report "no required_sections configured" as informational (not an error)
+6. If frontmatter `amd.kind` diverges from config `kind`, report as error
 
-#### Why not just use JSON Schema `allOf`
+This is a pure query against existing data — no schema files, no separate subsystem. The section tree is already built and persisted by the parsing plan on every `amd refresh`.
 
-Because JSON Schema is a validation language, not a complete inheritance language. The JSON Schema project’s own guidance says inheritance is not something it can model perfectly in general.[5]
+### How it gets created
 
-So the right model is:
+When `amd init --kind report.incident` runs:
 
-- JSON Schema or Pydantic validates the shape of AMD schema documents
-- AMD core resolves semantic inheritance itself
+1. AMD looks up the built-in template for `report.incident`
+2. AMD creates `.amd/config/<new_artifact_id>.yml` seeded with the template values (freshness_class, stale_after, required_sections, etc.)
+3. The agent can adjust any field afterward as this artifact's needs become clearer
 
-### 8. Derivation contracts should be single-sourced
+Built-in templates are hardcoded in AMD core. They provide sensible starting points for common artifact types. The template is copied into the config file at creation time — it is a snapshot, not a live reference. Subsequent changes to built-in templates (in AMD upgrades) do not retroactively affect existing config files.
 
-Avoid defining the same mapping in both source and target schemas.
+When an agent creates an artifact without `amd init` (e.g. just writes a Markdown file and runs `amd refresh`):
 
-Bad pattern:
+1. AMD detects the new artifact
+2. AMD creates a config file with no fields — universal hardcoded defaults apply to everything
+3. The agent can populate the config file to define this artifact's operational policy
 
-- source schema says `decision-rules -> triage-steps`
-- target schema repeats the same mapping in reverse
+### How it gets updated
 
-That creates two sources of truth.
+The agent updates config/ when:
 
-Recommended rule:
+- The user clarifies policy ("this report should be checked every 2 hours")
+- The agent adds signal tracking to an artifact
+- The agent sets up a derivation relationship
+- The user or agent decides this artifact needs different required sections
+- The user changes how this specific artifact should behave
 
-- the source schema owns the transform contract
-- the target schema owns only its own shape and ownership constraints
+Config files are YAML, human-readable, agent-editable. No special AMD command needed — the agent or user can edit directly, and `amd refresh` picks up changes.
 
-Optional target-side hint:
+### The `.amd/` directory pattern
 
-- a target schema may declare `accepts_from: [mental_model]` for discoverability or validation, but it should not duplicate the section mapping contract
-
-### 9. Config composition and `extends`
-
-MyST shows that composable configuration is useful,[1] but also shows how override and path semantics can become tricky.
-
-Recommended AMD v2 rule:
-
-- support **local-file `extends` only**
-- do not support remote URL config inheritance in v2
-
-Why:
-
-- more reproducible
-- easier to cache and debug
-- avoids security ambiguity for an agent-native CLI
-
-#### Recommended merge semantics for `extends`
-
-Given:
-
-```yaml
-extends:
-  - ./base.yml
-  - ./team.yml
+```
+.amd/
+  config/<artifact_id>.yml        # how to evaluate (policy, signals, derive contracts)
+  journal/<artifact_id>.jsonl     # what happened (activity history)
+  signals/<artifact_id>.jsonl     # what the world says (observations)
+  cache/index.sqlite              # computed state (derived, rebuildable)
+  export/amd.xref.json            # agent bootstrap map (derived, rebuildable)
+  export/artifacts/<id>.json      # per-artifact detail (derived, rebuildable)
 ```
 
-Apply in order:
+Three per-artifact source-of-truth layers (config, journal, signals), keyed consistently by artifact ID. One derived cache. One export layer. No project-level definition files.
 
-1. load `base.yml`
-2. overlay `team.yml`
-3. overlay the current file
+## Resolution Order
 
-Recommended merge behavior:
+When AMD needs an effective value for an artifact (e.g. `stale_after`):
 
-- scalars override
-- maps deep-merge
-- lists replace by default
-- explicit `null` clears inherited values
+1. **Universal hardcoded default** — always available (e.g. `tactical` / `24h`)
+2. **`.amd/config/<artifact_id>.yml`** — per-artifact policy
+3. **Artifact frontmatter `amd.policy`** — local one-off overrides
 
-This is intentionally simpler than “magic list concatenation” so config composition stays predictable.
+Later layers override earlier ones.
 
-### 10. Unknown or schema-less artifacts
+### Null semantics
 
-AMD should keep schema use optional.
+- **Field absent** — inherit from the next layer down (hardcoded default)
+- **Field set to `null`** — explicitly unset. The value is cleared. It does not fall back to a lower layer. The artifact has no value for this field.
+- **Field set to a value** — that value is used
 
-This is one of the strongest borrowable ideas from Dendron: schemas are an optional type system, not a requirement for every note.[3]
+This distinction matters. `stale_after: null` in a per-artifact config means "this artifact has no staleness policy" — it opts out. Removing the `stale_after` line entirely means "use the hardcoded default." These are different intentions and the system respects both.
 
-For AMD, that means:
+## Universal Hardcoded Defaults
 
-- a doc with no known schema is still a valid AMD artifact
-- AMD can still track identity, sections, relations, temporal state, and directives
-- schema validation simply does not apply
-- `amd doctor` should report “unschematized” separately from “invalid against schema”
+When no config field is specified, AMD uses these values:
 
-This matters because AMD explicitly wants to support messy, organic Markdown repositories.
+| Parameter | Default | Rationale |
+|---|---|---|
+| `freshness_class` | `tactical` | Safe middle ground for most documents |
+| `stale_after` | `86400` (24h) | One day is reasonable for tactical docs |
+| `refresh_mode` | `auto` | Normal recomputation on every refresh |
+| `required_sections` | `[]` (empty) | No section validation by default |
+| `optional_sections` | `[]` (empty) | No section hints by default |
+| `priority.coefficients.freshness` | `10` | |
+| `priority.coefficients.caveat` | `5` | |
+| `priority.coefficients.signal_warn` | `10` | |
+| `priority.coefficients.signal_critical` | `20` | |
+| `priority.coefficients.derivation_drift` | `10` | |
+| `signals.windows` | `[15m, 1h, 6h, 24h, 7d]` | Standard rollup windows |
+| `signals.silence_multiplier` | `6` | 6x expected cadence before flagging silence |
 
-### 11. Validation strategy
+These are compiled into AMD core. They are not user-configurable in v2. If a future version needs project-level tuning for these universal values, a project config can be added then.
 
-AMD needs validation at two levels:
+## Built-In Kind Templates
 
-1. **document validation**
-   - is `config.yml` structurally valid?
-   - is `report.incident.yml` structurally valid?
+AMD ships with built-in templates for common artifact types. These are used by `amd init --kind <type>` to seed the config file. They are not a runtime resolution layer — they are copied into the config file at creation time.
 
-2. **semantic validation**
-   - are there schema cycles?
-   - does a parent exist?
-   - do derive mappings point at valid section labels?
-   - does `kind_policy_overrides.report.incident` reference a known schema or known kind?
+Built-in templates (starting set):
 
-Recommended approach:
+| Kind | freshness_class | stale_after | required_sections |
+|---|---|---|---|
+| `report.incident` | `observational` | `4h` | executive-summary, current-context, risk-assessment, caveats |
+| `report.postmortem` | `tactical` | `168h` | incident-summary, timeline-of-events, contributing-factors, remediation |
+| `runbook` | `foundational` | `720h` | purpose, prerequisites, steps |
+| `mental_model` | `foundational` | `720h` | (none) |
+| `decision` | `tactical` | `168h` | context, options, decision, rationale |
 
-- use typed internal models to validate loaded YAML
-- emit JSON Schema from those models for docs/tests/tooling when helpful
-- perform semantic validation in AMD core after loading
+If `amd init --kind <type>` receives a kind with no built-in template, AMD creates a config file with just `kind: <type>` and universal hardcoded defaults apply.
 
-Implementation note:
+The agent can define any custom kind string — `kind` is free-form. Custom kinds just don't get template seeding.
 
-- Pydantic is a strong fit here because it validates Python data via `model_validate()` and can emit JSON Schema from models.[6][7]
+## What Frontmatter Owns
 
-### 12. Agent layer
+Frontmatter carries identity and rare local policy overrides. It should be minimal.
 
-The agentic layer here is not “invent the schema.” It is “decide which layer a change belongs in.”
+### What frontmatter contains
 
-#### The agent should put a change in:
+```yaml
+---
+title: Payments Incident Report — Critical
+amd:
+  id: report.payments.incident-2026-03-11
+  kind: report.incident           # informational — must match config if present
+  policy:
+    stale_after: 2h               # this one is extra urgent
+---
+```
 
-- **project config** when it is project-wide operational policy
-  - example: default freshness class
-  - example: signal windows
-  - example: hooks
+- `amd.id` — artifact identity. Required.
+- `amd.kind` — informational only. AMD does not use this for kind resolution. If present, `amd doctor` checks that it matches the config file's `kind` and flags divergence as an error.
+- `amd.policy.*` — one-off policy overrides for this artifact instance. These are the highest-precedence layer in resolution.
 
-- **schema** when it is kind-wide semantics
-  - example: incident reports require `risk-assessment`
-  - example: mental models can derive runbooks
-  - example: runbook default freshness is tactical
+Frontmatter is for: "this specific artifact instance is temporarily different from its config."
 
-- **artifact frontmatter** when it is instance-specific
-  - example: this incident is extra urgent, `stale_after: 2h`
-  - example: this legacy doc clears `stale_after`
+### What should NOT be in frontmatter
 
-#### What the agent should actively do
+- Computed state (staleness, priority, signal rollups)
+- Full signal definitions (those belong in config/)
+- Derive contracts (config/ is the canonical home)
+- Required section lists (those belong in config/)
+- Caveat lists (those live in journals)
+- Kind assignment (config/ is authoritative)
 
-1. Prefer config/schema defaults over per-artifact overrides.
-2. If the same frontmatter override appears repeatedly across many artifacts, suggest lifting it into a schema or project config.
-3. If no schema fits, create or keep the artifact unschematized rather than forcing a bad kind match.
-4. Do not invent new config or schema keys outside the spec.
-5. When creating schemas, keep them kind-centric, not path-centric.
+If the same frontmatter override appears across many artifacts, the agent should lift it into config/ files.
 
-#### Practical decision rule for agents
+## Derive Contracts: Canonical Home
 
-Ask:
+Derive contracts live in per-artifact config files only.
 
-- “Does this apply to the whole project?”
-  - `config.yml`
-- “Does this apply to every artifact of one kind?”
-  - schema file
-- “Does this apply only to this artifact?”
-  - frontmatter
+When `amd derive` creates a new derivation, the agent records the contract in the source artifact's config file. This makes every derivation relationship explicit and traceable to a specific artifact's config.
 
-### 13. How this ties into the other v2 plans
+Frontmatter is **not** a home for derive contracts. Derive contracts are structural relationships, not one-off overrides.
 
-#### Source format
+## Agent Layer
 
-- source docs carry only minimal instance metadata in frontmatter
-- config and schemas stay in YAML under `.amd/`
+### What the agent should actively do
 
-#### Context graph
+1. **Set kind and policy at artifact creation.** When creating a new artifact, use `amd init --kind <type>` to seed the config file. Review the seeded values and adjust if this artifact is different from the template.
 
-- resolved kind and policy belong in the index
-- schemas inform artifact type and derive edges
+2. **Treat config/ as the operational lever.** Config is where the agent tunes how AMD evaluates this artifact — freshness, signals, required sections, derive contracts, refresh mode. It is the primary surface for all operational policy.
 
-#### Parsing and section identity
+3. **Infer kind from document purpose.** Daily reports -> `report.incident`. Architecture decisions -> `decision`. The agent picks the right kind for classification, but then reviews and adjusts the seeded config fields based on this artifact's actual needs.
 
-- schema-required section labels can be validated against parsed section IDs
+4. **Prefer config/ over frontmatter.** Frontmatter is for temporary exceptions. Config/ is for the normal operating parameters.
 
-#### Temporal context
+5. **Update config/ when the user clarifies policy.** "This report should be checked every 2 hours" -> edit config/ `stale_after`.
 
-- temporal policy resolution depends on config -> schema -> frontmatter precedence
+6. **Record derive contracts in config/.** After running `amd derive`, ensure the source artifact's config/ has the contract recorded.
 
-#### Changes propagation
+7. **Add signal definitions to config/ when connecting an artifact to external metrics.** The agent writes the metric name, expected cadence, and thresholds.
 
-- kind and schema information help agents know which docs are likely affected and how derived docs should be updated
+8. **Handle bulk kind-level changes as a propagation operation.** If the user says "all incident reports should require a timeline section," the agent queries by kind, filters relevant config files, and updates them. This uses the same capture → affected → filter → edit workflow as any other propagation.
 
-## Areas Of Consensus
+### Practical decision rule
 
-- config and schemas should be separate layers
-- project policy and kind semantics should not be mixed
-- schema use should remain optional
-- project overrides should not become a second schema registry
-- inheritance should be resolved in AMD logic, not outsourced entirely to JSON Schema
+- "What kind is this artifact?" -> config/ `kind` field
+- "What policy governs this artifact?" -> config/ (everything is here)
+- "Is this one instance temporarily different?" -> frontmatter `amd.policy`
+- "Change behavior for all artifacts of a kind?" -> agent updates relevant config/ files in bulk
 
-## Areas Of Debate
+## How This Ties Into Other v2 Plans
 
-- whether schema `sections` should be nested as recommended here or remain as top-level `required_sections` / `optional_sections` for maximal brevity
-- whether template files should live under `.amd/templates/` or a separate project-relative templates directory
-- whether target schemas should have a light `accepts_from` hint or no derive-related fields at all
-- whether `extends` should support only one parent in v2 for simplicity, or an ordered list as recommended here
+### Context graph architecture
 
-## Recommendation
+- config/ files are read during refresh to populate `artifact_temporal` in SQLite
+- derive contracts in config inform derivation drift detection
+- the `.amd/` directory layout has `config/` alongside `journal/` and `signals/`
 
-Implement config and schemas with this strict split:
+### Temporal context handling
 
-1. `.amd/config.yml` for project policy, runtime, hooks, and kind policy overrides
-2. `.amd/schemas/*.yml` for kind semantics, inheritance, templates, ownership, and derive contracts
-3. artifact frontmatter for local exceptions only
-4. application-level schema inheritance resolution
-5. typed validation plus semantic post-validation
-6. schema use remains optional for messy repositories
+- `stale_after`, `freshness_class`, and `refresh_mode` come from config/ with hardcoded fallback
+- signal thresholds for breach/silence detection come from config/
+- priority coefficients are hardcoded in AMD core (universal)
+- signal windows and silence multiplier are hardcoded in AMD core
 
-That is the best fit for AMD’s design goals. It keeps project behavior tunable, kind semantics reusable, and organic Markdown repos first-class instead of forcing every file into a rigid hierarchy.
+### Markdown parsing and section identity
 
-## Sources
+- `required_sections` are read from config/ and validated against the section tree in SQLite
+- `amd doctor` queries SQLite's `sections` table and compares against config's required sections — no separate schema system needed
+- `amd doctor` checks frontmatter `amd.kind` against config `kind` and flags mismatches
+- config/ does not interact with the parser — it is purely operational
 
-[1] MyST Markdown, “Configuration and content frontmatter.” Official docs. Project/page layering, override behavior, explicit `null`, and `extends`. <https://mystmd.org/guide/configuration>
+### Changes propagation
 
-[2] MyST Markdown, “Content frontmatter options.” Official docs. Field behavior categories such as `project only`, `page only`, and `page can override project`. <https://mystmd.org/guide/frontmatter>
+- When a user clarifies policy for one artifact, the agent updates that artifact's config/
+- When a user clarifies policy for a kind (bulk change), the agent queries by kind and updates relevant config/ files
+- `amd affected` does not search config/ — it searches FTS5 over artifact content
+- config/ changes do not trigger `content_changed` events (config is operational metadata, not content)
 
-[3] Dendron, “Schemas.” Official docs. Schemas as an optional type system, automatic template insertion, and unknown-schema notes remaining allowed. <https://wiki.dendron.so/notes/c5e5adde-5459-409b-b34d-a0d75cbb1052/>
+### Source format and agent-readable surfaces
 
-[4] JSON Schema, “Specification.” Official docs. Meta-schemas and validation vocabularies. <https://json-schema.org/specification>
+- frontmatter stays minimal: `amd.id`, optional informational `amd.kind`, optional `amd.policy` overrides
+- config/ is a machine surface, not an authoring surface — agents read and write it
+- JSON exports include resolved temporal state (from SQLite), not raw config/ contents
 
-[5] JSON Schema, “Modelling Inheritance with JSON Schema.” Official blog. Explicitly notes that inheritance is not something JSON Schema can model perfectly in general. <https://json-schema.org/blog/posts/modelling-inheritance>
+### Bootstrap and project setup
 
-[6] Pydantic, “Models.” Official docs. `model_validate()` and validation modes over Python/JSON/string data. <https://docs.pydantic.dev/latest/concepts/models/>
+- `amd init --project` creates the `.amd/` directory structure (config/, journal/, signals/, cache/, export/)
+- `amd init --kind <type>` seeds config/ with built-in template values for that kind
+- Projects that use custom kinds get universal hardcoded defaults — zero config required beyond `kind`
 
-[7] Pydantic, “JSON Schema.” Official docs. Pydantic models can generate JSON Schema. <https://docs.pydantic.dev/latest/concepts/json_schema/>
+## Gaps and Further Research
 
-[8] Hugo, “Front matter.” Official docs. Frontmatter formats and cascade behavior; useful comparison point for targeted inheritance/cascade. <https://gohugo.io/content-management/front-matter/>
-
-## Gaps And Further Research
-
-- decide the final field names for schema section definitions (`sections.required` vs `required_sections`)
-- decide the final template-path convention
-- decide whether unschematized artifacts should carry an explicit generic `kind`
-- define exact JSON Schema / Pydantic models for config and schema documents
+- Define the full set of AMD built-in kind templates (the table above is a starting point)
+- Decide whether `amd doctor` should distinguish severity levels for missing required vs optional sections
+- Decide whether config/ should support a `signals.*.dimensions` field for multi-dimensional metric filtering
+- Define exact Pydantic models for config/ validation and resolution
+- Decide whether a bulk config update command (e.g. `amd config --kind report.incident --set required_sections+=timeline`) is needed in v2 or whether agent-driven multi-file edits are sufficient

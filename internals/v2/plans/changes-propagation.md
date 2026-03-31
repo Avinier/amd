@@ -45,7 +45,7 @@ These are pure operations. No judgment, no AI, no heuristics about what "should"
 - `amd affected` — query the graph for candidate artifacts/sections related to a topic
 - `amd refresh` — re-scan files and update the index after edits
 - `amd link` — record a relation edge between graph entities
-- All existing commands from the skeleton (event, caveat, signal, scan, query, etc.)
+- All existing commands from the skeleton (caveat, signal, scan, query, etc.)
 
 The core layer is deterministic. Given the same graph state and the same query, it returns the same candidates. It never silently rewrites content. It never decides which files to update.
 
@@ -110,8 +110,9 @@ This means the agent layer is swappable. Claude Code gets one prompt. Codex gets
    → index catches content changes, updates fingerprints
 
 8. Agent calls AMD core:
-   $ amd link directive:amd-metadata-context --edge reflected_in --targets artifact:context-graph,artifact:scaffold,artifact:skeleton
-   → records which artifacts were updated to reflect this directive
+   $ amd link directive:amd-metadata-context --edge reflected_in \
+       --targets section:context-graph:where-to-store,section:scaffold:journal-layer,section:skeleton:directory-layout
+   → records which sections were updated to reflect this directive
 ```
 
 ## What AMD Core Needs For This
@@ -145,11 +146,11 @@ amd capture --type directive --directive-type clarification --statement "..." [-
 
 What it does:
 
-- Creates a directive/assertion record in the index
-- Writes the canonical record into `.amd/` metadata storage
+- Appends a directive/assertion journal record to `.amd/journal/_project.jsonl` (canonical source of truth)
+- Updates the directive node and edges in the SQLite index (derived, rebuildable from journals)
 - Returns the `directive_id`
 
-This is a core command. It does not decide what to do with the directive — it just records it.
+This is a core command. It does not decide what to do with the directive — it just records it. The journal append is the durable write; the index is a derived projection that `amd reindex` can rebuild.
 
 ### New command: `amd affected`
 
@@ -192,20 +193,35 @@ FTS5 indexes titles, headings, labels, and section text. This is what makes topi
 
 ### New edge type: `reflected_in`
 
-For connecting directives/assertions to the artifacts they affected.
+For connecting directives/assertions to the specific sections they affected. `reflected_in` edges target sections, not artifacts, so that future drift checks and `amd history` can trace exactly which section now reflects which directive. This is consistent with the temporal plan's `directive_propagated` activity type, which already tracks `target_sections` at section granularity.
 
 ```
-directive:amd-metadata-context --reflected_in--> artifact:context-graph-arch
-directive:amd-metadata-context --reflected_in--> artifact:scaffold
+directive:amd-metadata-context --reflected_in--> section:context-graph:where-to-store
+directive:amd-metadata-context --reflected_in--> section:scaffold:journal-layer
+directive:amd-metadata-context --reflected_in--> section:skeleton:directory-layout
 ```
 
-This creates a traceable record: "this directive is reflected in these artifacts."
+This creates a traceable record: "this directive is reflected in these sections." Artifact-level rollups can be derived by grouping edges by the target section's `artifact_id`.
 
 Related edges AMD should support:
 
 - `applies_to` for scoping a directive to artifacts/sections/domains
 - `supersedes` for replacing an older directive
 - `contradicted_by` for surfacing drift or inconsistency
+- `references` for connecting an artifact or section to a definition or structural spec it references in another artifact
+
+### Edge type: `references`
+
+For connecting artifacts or sections that reference a definition, layout, or structural spec from another artifact.
+
+```
+artifact:skeleton:F5 --references--> artifact:temporal-plan:section-3
+artifact:context-graph:storage-layout --references--> artifact:temporal-plan:journal-storage
+```
+
+This is not a derivation (no transform contract, no re-derive). It is a lightweight structural hint: "this section uses or quotes a definition from that section." When the referenced section changes, `amd affected` follows `references` edges to surface the referencing sections as candidates.
+
+The agent creates `references` edges when it notices cross-document structural dependencies. AMD core does not infer them automatically — the agent recognizes "I just wrote section X based on the definition in section Y" and records the edge.
 
 ## What The Agent Layer Needs
 
@@ -221,6 +237,18 @@ When the user says something that sounds like a directive, constraint, clarifica
 - Then run `amd affected` to find what needs updating
 
 Not every user statement is a directive. The agent uses judgment.
+
+**1b. Recognizing structural changes**
+
+Propagation is not only triggered by user clarifications. The other trigger is: the agent itself just made a structural change to a spec, plan, or definition document — refactored a data model, changed a storage layout, renamed a type, altered a contract.
+
+After making such a change, the agent should proactively:
+
+- Run `amd affected` with key terms from the change to find documents that reference the old structure
+- Follow `references` edges from the changed section to find structurally linked documents
+- Filter, edit, and close the loop the same way as for user clarifications
+
+The difference is that no `amd capture` is needed — there is no user directive. The change itself is the trigger, and it is already recorded as a `content_changed` activity. The agent's job is to recognize "I changed something that other documents depend on" and act on it without being told.
 
 **2. Filtering candidates**
 
@@ -270,10 +298,30 @@ When the user makes a clarification, constraint, or decision about the project:
 
 5. Update the graph:
    amd refresh
-   amd link <directive_id> --edge reflected_in --targets <updated_artifact_ids>
+   amd link <directive_id> --edge reflected_in --targets <updated_section_ids>
 
 6. Tell the user what you updated:
    "Updated 3 of 10 candidate sections to reflect: <clarification>"
+
+When you make a structural change to a spec, plan, or definition document:
+
+1. Find affected documents:
+   amd affected --query "<key terms from what you changed>"
+
+2. Review the candidate list the same way — read, judge, filter.
+
+3. Edit only sections that reference the old structure. Make targeted changes.
+
+4. Record structural links for future propagation (referencing section → referenced section):
+   For each updated referencing section:
+     amd link <referencing_section> --edge references --targets <changed_section>
+
+5. Update the graph:
+   amd refresh
+
+6. Tell the user what you propagated:
+   "Changed journal layout in temporal plan. Updated 4 referencing sections
+    in skeleton, context-graph, scaffold, and usecase."
 ```
 
 ## What This Changes In Existing Plans

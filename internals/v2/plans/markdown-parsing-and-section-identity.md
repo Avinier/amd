@@ -435,5 +435,4 @@ This layer is exercised when an agent:
 
 - Decide whether AMD wants full MyST parser dependency in v2 or only compatibility behavior
 - Specify the exact canonical serialization format used before hashing
-- Define the confidence thresholds for unlabeled-section continuity matching
 - Decide whether `amd doctor` should auto-suggest labels for referenced unlabeled sections

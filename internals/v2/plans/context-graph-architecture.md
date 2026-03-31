@@ -121,7 +121,7 @@ Some relationships are hierarchical:
 But the important AMD relationships are not hierarchical:
 
 - `plann.md` is a revision of `plan.md`
-- a runbook is derived from a mental model
+- a runbook is derived from an incident report
 - an incident report feeds a postmortem
 - two notes are alternate views of the same thing
 - one note supersedes another
@@ -264,17 +264,44 @@ Suggested `origin` set:
 - `observed`
 - `heuristic`
 
-### 6. Activity record
+#### Edge ending rules
 
-Represents the operation that created or changed graph state.
+The `ended_at` field on edges marks when a relationship ceased to be active. Ended edges are never deleted from the index — they remain for history and provenance. Active queries filter them out by default; `amd history` shows them.
 
-Fields:
+Rules for when `ended_at` is set:
+
+- **Artifact archived**: all edges where the archived artifact is `src_entity_id` or `dst_entity_id` get `ended_at = now`. This applies to all edge types — `contains`, `references`, `derived_from`, `reflected_in`, etc.
+- **Section removed**: when a labeled section disappears and cannot be confidently matched on refresh, edges targeting that section get `ended_at = now`. The section record itself is retained with a terminal state.
+- **Derivation re-run**: when `amd derive` re-derives a target from a source, old `derived_from` edges between that source-target pair get `ended_at = now`, and new edges are created. This ensures provenance tracks each derivation pass separately.
+- **Directive superseded or revoked**: when a directive transitions to `superseded` or `revoked`, its `reflected_in` edges get `ended_at = now`.
+- **Explicit unlinking**: `amd link --remove` (if supported) sets `ended_at` on the specified edge.
+
+Edges are never hard-deleted because:
+
+- provenance chains must remain traceable
+- `amd history` needs to show what relationships existed and when they ended
+- `amd reindex` must be able to reconstruct edge history from journals
+
+### 6. Journal record
+
+Represents the operation that created or changed graph state. Fully defined in temporal-context-handling.md § `JournalRecord`.
+
+Core envelope (mandatory):
 
 - `activity_id`
-- `activity_type` (`refresh`, `link`, `derive`, `materialize`, `doctor`)
-- `agent`
-- `timestamp`
-- `payload_json`
+- `activity_type` (see temporal plan for the full activity type reference)
+- `artifact_id`
+- `occurred_at`
+- `recorded_at`
+
+Agent/user context (agent-authored, core stores but does not validate):
+
+- `target_entity_type` (`artifact`, `section`, `directive`)
+- `target_entity_id`
+- `section_ids` nullable
+- `actor`
+- `summary`
+- `detail_json`
 
 This keeps provenance lightweight without forcing full graph-DB semantics.
 
@@ -333,13 +360,13 @@ Recommended layout:
 
 ```text
 .amd/
+  config/
+    <artifact_id>.yml           # Per-artifact operational config (freshness, signals, derive)
   journal/
-    activities/
-      2026-03.jsonl
-    relations/
-      2026-03.jsonl
-    derivations/
-      2026-03.jsonl
+    <artifact_id>.jsonl         # Per-artifact JournalRecords
+    _project.jsonl              # Project-level records (refresh_run, etc.)
+  signals/
+    <artifact_id>.jsonl         # Per-artifact SignalPoint timeseries
   cache/
     index.sqlite
   export/
@@ -348,8 +375,10 @@ Recommended layout:
       <artifact_id>.json
 ```
 
-### Why this split
+### Why this layout
 
+- config, journals, and signals are all flat-by-type, per-artifact — O(1) single-artifact lookup and efficient cross-artifact grepping
+- config/ holds the operational parameters AMD reads on refresh to evaluate each artifact (freshness policy, signal thresholds, derive contracts)
 - journals are safe for append-heavy multi-agent writes
 - SQLite is fast for read-heavy traversal and ranking
 - export files give agents and wrappers a cheap bootstrap map without reparsing Markdown
@@ -402,6 +431,9 @@ Keep it minimal.
 - `heading TEXT`
 - `ordinal INTEGER`
 - `structural_fingerprint TEXT`
+- `content_fingerprint TEXT`
+- `snippet TEXT` — eagerly stored first paragraph or first ~200 characters of normalized plain text, computed on refresh. Used by `amd affected` to return cheap candidate previews without reopening source files.
+- `plain_text TEXT` — normalized plain-text section content, fed into the `artifact_search` FTS5 table alongside headings and labels. Not the full Markdown source — whitespace-collapsed, markers stripped, generated blocks excluded.
 
 ### `edges`
 
@@ -429,13 +461,67 @@ Keep it minimal.
 - `updated_at TEXT`
 - `superseded_by TEXT`
 
-### `activities`
+### `journal_records`
 
 - `activity_id TEXT PRIMARY KEY`
 - `activity_type TEXT`
-- `agent TEXT`
-- `timestamp TEXT`
-- `payload_json TEXT`
+- `artifact_id TEXT`
+- `occurred_at TEXT`
+- `recorded_at TEXT`
+- `actor TEXT`
+- `summary TEXT`
+- `detail_json TEXT`
+
+### `artifact_temporal`
+
+Per-artifact temporal facts. Written on refresh from journals, signals, and config/ files. Read at query time by `amd agenda`, `amd prime`, and `amd query --stale`.
+
+- `artifact_id TEXT PRIMARY KEY`
+- `freshness_class TEXT` — resolved via 3-layer precedence (hardcoded -> config/ -> frontmatter)
+- `stale_after_seconds INTEGER` — resolved via 3-layer precedence (hardcoded -> config/ -> frontmatter)
+- `refresh_mode TEXT` — resolved via 3-layer precedence (hardcoded -> config/ -> frontmatter) (`auto`, `manual`, `frozen`, `live`). Gates which refresh steps apply.
+- `freshness_anchor_at TEXT` — `max(last_changed_at, last_reviewed_at)`
+- `stale_state TEXT` — snapshot from last refresh: `fresh`, `aging`, or `stale`. Stored for transition detection.
+- `last_changed_at TEXT` — from `content_changed` journal events
+- `last_observed_at TEXT` — from most recent refresh that parsed this artifact
+- `last_reviewed_at TEXT` — from `review_recorded` journal events
+- `last_signal_at TEXT` — from most recent signal point `observed_at`
+- `first_seen_at TEXT` — from `artifact_created` journal event
+- `active_caveat_count INTEGER` — maintained on caveat add/mitigate/expire events
+- `signal_breach_count INTEGER` — maintained on breach enter/clear events
+- `signal_silence_count INTEGER` — maintained on silence enter/clear events
+- `derivation_drift_count INTEGER` — maintained on drift enter/clear events
+
+### `section_temporal`
+
+Per-section temporal facts. Same pattern as artifact_temporal but scoped to sections.
+
+- `section_id TEXT PRIMARY KEY`
+- `artifact_id TEXT`
+- `last_changed_at TEXT`
+- `last_observed_at TEXT`
+- `last_reviewed_at TEXT`
+- `freshness_anchor_at TEXT` — `max(last_changed_at, last_reviewed_at)`
+- `active_caveat_count INTEGER`
+
+### `signal_rollups`
+
+Derived windowed summary for one metric. Computed incrementally from raw `SignalPoint` records in `.amd/signals/` on refresh. Rebuildable from JSONL if the index is deleted.
+
+- `artifact_id TEXT`
+- `metric TEXT`
+- `window TEXT` — one of the configured windows (default: `15m`, `1h`, `6h`, `24h`, `7d`)
+- `window_end_at TEXT`
+- `count INTEGER`
+- `min REAL`
+- `max REAL`
+- `mean REAL`
+- `latest_observed_at TEXT`
+- `latest_value REAL`
+- `slope REAL` — nullable, requires count >= 2
+- `cadence_health REAL` — nullable, requires expected_cadence configured
+- `source_offset INTEGER` — byte offset into JSONL for incremental reads
+- `PRIMARY KEY (artifact_id, metric, window)`
 
 ### `artifact_search`
 
@@ -448,72 +534,446 @@ FTS5 virtual table for:
 
 This is required. Topic-based discovery depends on it.
 
+## Write-Time vs Query-Time Computation
+
+This is a critical design detail. SQLite has no sense of time on its own. The right model is: store temporal facts on refresh, compute time-dependent values at query time using `unixepoch('now')`.
+
+### Stored facts (written on refresh)
+
+These are stable between refreshes. They change only when something actually happens.
+
+| Column | Written when | Source |
+|---|---|---|
+| `freshness_anchor_at` | content_changed or review_recorded | journals |
+| `last_changed_at` | content_changed | journals |
+| `last_reviewed_at` | review_recorded | journals |
+| `last_signal_at` | signal_ingested | signals/ |
+| `last_observed_at` | every refresh that parses this file | refresh |
+| `stale_after_seconds` | refresh reads config/ | config/ |
+| `freshness_class` | refresh reads config/ | config/ |
+| `active_caveat_count` | caveat_added / caveat_mitigated / caveat_expired | journals |
+| `signal_breach_count` | signal_breach_entered / signal_breach_cleared | journals |
+| `signal_silence_count` | signal_silence_entered / signal_silence_cleared | journals |
+| `derivation_drift_count` | derivation_drift_entered / derivation_drift_cleared | journals |
+| Signal rollup values | refresh processes new signal points | signals/ |
+
+### Computed at query time (using `unixepoch('now')`)
+
+These are always current because they are evaluated on every read.
+
+| Value | Formula |
+|---|---|
+| `staleness_ratio` | `CASE WHEN stale_after_seconds IS NULL THEN NULL ELSE (unixepoch('now') - unixepoch(freshness_anchor_at)) * 1.0 / stale_after_seconds END` |
+| `stale_state` | `CASE WHEN staleness_ratio IS NULL THEN 'exempt' WHEN staleness_ratio < 0.5 THEN 'fresh' WHEN staleness_ratio < 1.0 THEN 'aging' ELSE 'stale' END` |
+| `signal_silent` (per metric) | `unixepoch('now') - unixepoch(latest_observed_at) > expected_cadence_seconds * 6` |
+| `priority_score` | Composite formula over staleness_ratio + count penalties (see below) |
+
+**Null staleness semantics:** When `stale_after_seconds` is `NULL` (the config plan allows `stale_after: null` to mean "this artifact has no staleness policy"), `staleness_ratio` is `NULL` and `stale_state` is `'exempt'`. These artifacts never appear in `amd query --stale` results. They still appear in `amd agenda` if they have active caveats, signal breaches, signal silences, or derivation drift — their freshness penalty is simply zero.
+
+### Priority score formula (evaluated in SQL)
+
+```sql
+CAST(
+  10.0 * MIN(COALESCE(staleness_ratio, 0.0), 5.0)  -- freshness penalty (capped; 0 when exempt)
+  + 5.0 * active_caveat_count                        -- caveat penalty
+  + 10.0 * signal_breach_count                       -- signal warn penalty
+  + 20.0 * (CASE WHEN signal_breach_count > 2
+             THEN signal_breach_count - 2 ELSE 0 END)  -- signal critical escalation
+  + 10.0 * derivation_drift_count                    -- derivation drift penalty
+AS REAL) AS priority_score
+```
+
+The coefficients (10, 5, 10, 20, 10) are hardcoded in AMD core. They are not user-configurable in v2.
+
+## Key Query Patterns
+
+### `amd agenda` — ranked list of artifacts needing attention
+
+```sql
+WITH temporal AS (
+  SELECT
+    t.artifact_id,
+    a.title,
+    a.kind,
+    a.current_path,
+    CASE WHEN t.stale_after_seconds IS NULL THEN NULL
+         ELSE (unixepoch('now') - unixepoch(t.freshness_anchor_at)) * 1.0
+              / t.stale_after_seconds
+    END AS staleness_ratio,
+    CASE
+      WHEN t.stale_after_seconds IS NULL THEN 'exempt'
+      WHEN (unixepoch('now') - unixepoch(t.freshness_anchor_at)) * 1.0
+           / t.stale_after_seconds < 0.5 THEN 'fresh'
+      WHEN (unixepoch('now') - unixepoch(t.freshness_anchor_at)) * 1.0
+           / t.stale_after_seconds < 1.0 THEN 'aging'
+      ELSE 'stale'
+    END AS stale_state,
+    t.active_caveat_count,
+    t.signal_breach_count,
+    t.signal_silence_count,
+    t.derivation_drift_count
+  FROM artifact_temporal t
+  JOIN artifacts a USING (artifact_id)
+  WHERE a.state = 'active'
+)
+SELECT *,
+  10.0 * MIN(COALESCE(staleness_ratio, 0.0), 5.0)
+  + 5.0 * active_caveat_count
+  + 10.0 * signal_breach_count
+  + 10.0 * derivation_drift_count AS priority_score
+FROM temporal
+WHERE COALESCE(staleness_ratio, 0.0) > 0.5
+   OR active_caveat_count > 0
+   OR signal_breach_count > 0
+   OR signal_silence_count > 0
+   OR derivation_drift_count > 0
+ORDER BY priority_score DESC;
+```
+
+### `amd prime` — full context for one artifact
+
+```sql
+SELECT
+  a.artifact_id, a.kind, a.title, a.current_path, a.state,
+  t.freshness_class, t.stale_after_seconds,
+  t.freshness_anchor_at, t.last_changed_at, t.last_reviewed_at,
+  t.last_signal_at, t.first_seen_at,
+  CASE WHEN t.stale_after_seconds IS NULL THEN NULL
+       ELSE (unixepoch('now') - unixepoch(t.freshness_anchor_at)) * 1.0
+            / t.stale_after_seconds
+  END AS staleness_ratio,
+  CASE
+    WHEN t.stale_after_seconds IS NULL THEN 'exempt'
+    WHEN (unixepoch('now') - unixepoch(t.freshness_anchor_at)) * 1.0
+         / t.stale_after_seconds < 0.5 THEN 'fresh'
+    WHEN (unixepoch('now') - unixepoch(t.freshness_anchor_at)) * 1.0
+         / t.stale_after_seconds < 1.0 THEN 'aging'
+    ELSE 'stale'
+  END AS stale_state,
+  t.active_caveat_count,
+  t.signal_breach_count,
+  t.signal_silence_count,
+  t.derivation_drift_count
+FROM artifacts a
+JOIN artifact_temporal t USING (artifact_id)
+WHERE a.artifact_id = ?;
+
+-- Plus: sections, edges, recent journal entries, signal rollups
+-- (separate queries joined in application code)
+```
+
+### `amd query --stale` — artifacts past staleness threshold
+
+```sql
+SELECT a.artifact_id, a.title, a.kind, a.current_path,
+  (unixepoch('now') - unixepoch(t.freshness_anchor_at)) * 1.0
+    / t.stale_after_seconds AS staleness_ratio
+FROM artifacts a
+JOIN artifact_temporal t USING (artifact_id)
+WHERE a.state = 'active'
+  AND t.stale_after_seconds IS NOT NULL
+  AND (unixepoch('now') - unixepoch(t.freshness_anchor_at)) * 1.0
+      / t.stale_after_seconds > 1.0
+ORDER BY staleness_ratio DESC;
+```
+
+### `amd affected` — FTS5 search + relation edge follow
+
+```sql
+-- Step 1: FTS5 search for matching sections
+SELECT s.section_id, s.artifact_id, s.label, s.heading,
+       snippet(artifact_search, 3, '<mark>', '</mark>', '...', 32) AS snippet
+FROM artifact_search
+JOIN sections s ON artifact_search.rowid = s.rowid
+WHERE artifact_search MATCH ?
+  AND (SELECT state FROM artifacts WHERE artifact_id = s.artifact_id) = 'active';
+
+-- Step 2: follow relation edges from matched artifacts (in application code)
+SELECT e.dst_entity_type, e.dst_entity_id, e.edge_type
+FROM edges e
+WHERE e.src_entity_id IN (/* matched artifact_ids */)
+  AND e.ended_at IS NULL;
+```
+
+## How Config Files Feed SQLite On Refresh
+
+During `amd refresh`, AMD resolves temporal policy for each known artifact using the 3-layer resolution chain (hardcoded -> config/ -> frontmatter) and uses it to populate SQLite:
+
+1. **Resolve temporal policy** — for each artifact, resolve `freshness_class`, `stale_after`, and `refresh_mode` through the 3-layer precedence: AMD hardcoded defaults -> `.amd/config/<artifact_id>.yml` -> frontmatter `amd.policy` overrides. Convert duration strings to seconds.
+2. **Write to `artifact_temporal`** — upsert `freshness_class`, `stale_after_seconds`, and `refresh_mode`
+3. **Gate on refresh_mode** — subsequent temporal steps (4–6) are skipped for `frozen` and unforced `manual` artifacts. `live` artifacts skip content-based staleness but run signal steps.
+4. **Read signal thresholds** — parse `signals.<metric>.thresholds` from resolved config
+5. **Evaluate against rollups** — compare `signal_rollups.latest_value` against thresholds, detect breaches/clears, update `signal_breach_count`
+6. **Read derive contracts** — parse `derive.targets` from resolved config
+7. **Check source fingerprints** — compare current source artifact fingerprint against fingerprint at last derivation, detect drift, update `derivation_drift_count`
+
+This means temporal policy is resolved once per refresh per artifact, and the resolved values are cached in SQLite for query-time use. Changing a config/ file or frontmatter policy takes effect on the next refresh.
+
 ## Update Strategy
 
 ### On `amd refresh`
 
 1. Scan configured Markdown roots.
-2. Parse frontmatter and Markdown AST.
-3. Build section tree for each file.
-4. Resolve stable artifact identity:
+2. Compare known artifact paths against found files. For each known active artifact whose file no longer exists at its `current_path`:
+   - transition artifact state to `archived`
+   - set `ended_at` on all active edges involving this artifact
+   - run archival cascade: emit `derivation_drift_entered` on downstream targets, auto-create caveat on downstream artifacts (see temporal-context-handling plan for cascade rules)
+3. Detect re-appeared files: if a scanned file contains an `amd.id` matching an archived artifact, transition that artifact back to `active` and reconnect edges where possible.
+4. Parse frontmatter and Markdown AST for all current files.
+5. Build section tree for each file.
+6. Resolve stable artifact identity:
    - explicit `amd.id` wins
    - otherwise treat as unmanaged/candidate
-5. Resolve stable section IDs:
-   - explicit label wins
-   - otherwise generated stable ID from local structure
-6. Compute structural fingerprints.
-7. Update locator table.
-8. Recompute `contains` edges from the AST.
-9. Rebuild explicit relation edges from journal records.
-10. Rebuild directive/assertion nodes from journals.
-11. Add heuristic candidate edges only as suggestions, not as authoritative facts.
+7. Resolve stable section IDs (per the parsing plan's identity model):
+   - explicit AMD label comment wins
+   - then MyST target label
+   - then heading attribute ID
+   - then persisted unlabeled-section match from prior refresh (requires same artifact, exact content fingerprint, same heading level, same nearest labeled ancestor)
+   - otherwise assign a new opaque persisted ID (e.g. `section:01jabc...`)
+   - if AMD cannot identify exactly one match for an unlabeled section, create a new section ID and let `doctor` flag the ambiguous rename/move
+8. Compute content and subtree fingerprints (per the parsing plan's Merkle-like model).
+9. Resolve temporal policy for each known artifact via the 3-layer chain (hardcoded -> config/ -> frontmatter):
+   - write resolved `freshness_class`, `stale_after_seconds`, and `refresh_mode` into `artifact_temporal`
+   - read signal thresholds for breach/silence evaluation
+   - read derive contracts for drift detection
+10. Gate per-artifact temporal steps on `refresh_mode` (see temporal-context-handling plan for mode semantics).
+11. Update locator table.
+12. Recompute `contains` edges from the AST.
+13. Rebuild explicit relation edges from journal records.
+14. Rebuild directive/assertion nodes from journals.
+15. Add heuristic candidate edges only as suggestions, not as authoritative facts.
 
 ### On `amd link`
 
-Append a relation record to `journal/relations/*.jsonl`, then update the index.
+Append a `relation_created` JournalRecord, then update the index. The record uses the canonical `JournalRecord` envelope from the temporal plan: core envelope fields (`activity_id`, `activity_type`, `artifact_id`, `occurred_at`, `recorded_at`) plus agent context fields (`target_entity_type`, `target_entity_id`, `actor`, `summary`, `detail_json`).
+
+**Journal partition rule:** The record is appended based on the source entity type:
+
+- `src_entity_type: artifact` or `section` — append to `journal/<src_artifact_id>.jsonl` (the envelope `artifact_id` is the source artifact)
+- `src_entity_type: directive` — the directive has no artifact file, so append to `journal/_project.jsonl` with `artifact_id: null`. Additionally, append a copy to `journal/<dst_artifact_id>.jsonl` for each destination artifact so that per-artifact history includes the edge. (The destination copy uses the destination artifact as its envelope `artifact_id`.)
 
 Example:
 
 ```json
 {
   "activity_id": "act_01",
-  "timestamp": "2026-03-11T13:00:00Z",
-  "agent": "codex",
-  "src_entity_type": "artifact",
-  "src_entity_id": "artifact:plann-auth-v2",
-  "dst_entity_type": "artifact",
-  "dst_entity_id": "artifact:plan-auth-v1",
-  "edge_type": "revision_of",
-  "origin": "declared"
+  "activity_type": "relation_created",
+  "artifact_id": "artifact:plann-auth-v2",
+  "occurred_at": "2026-03-11T13:00:00Z",
+  "recorded_at": "2026-03-11T13:00:01Z",
+  "target_entity_type": "artifact",
+  "target_entity_id": "artifact:plan-auth-v1",
+  "actor": "codex",
+  "summary": "Linked plann-auth-v2 as revision of plan-auth-v1",
+  "detail_json": {
+    "src_entity_type": "artifact",
+    "src_entity_id": "artifact:plann-auth-v2",
+    "dst_entity_type": "artifact",
+    "dst_entity_id": "artifact:plan-auth-v1",
+    "edge_type": "revision_of",
+    "origin": "declared"
+  }
 }
 ```
 
 ### On `amd derive`
 
-Append:
-
-- derivation activity
-- one or more `derived_from` edges
-- optional section-to-section edges for provenance
+Append a `derivation_updated` JournalRecord to `journal/<target_artifact_id>.jsonl`, plus one or more `relation_created` records for `derived_from` edges and optional section-to-section provenance edges. All records use the canonical `JournalRecord` envelope. See the temporal plan's `derivation_updated` activity type for the required and optional `detail_json` fields.
 
 ### On `amd capture`
 
-Append a directive/assertion record to the journal, then update the index.
+Append a JournalRecord to `journal/_project.jsonl` (directives are project-level entities, not scoped to a single artifact), then update the index. The `artifact_id` envelope field is null for directive creation. The directive's own fields (`directive_id`, `directive_type`, `statement`, `scope`, `status`) go into `detail_json`.
 
 Example:
 
 ```json
 {
   "activity_id": "act_02",
-  "timestamp": "2026-03-11T13:05:00Z",
-  "agent": "codex",
-  "directive_id": "directive:amd-metadata-context",
-  "directive_type": "clarification",
-  "statement": ".amd/ stores metadata plus a small amount of derived context, but never full user-authored documents",
-  "scope": "project",
-  "status": "active"
+  "activity_type": "directive_created",
+  "artifact_id": null,
+  "occurred_at": "2026-03-11T13:05:00Z",
+  "recorded_at": "2026-03-11T13:05:01Z",
+  "target_entity_type": "directive",
+  "target_entity_id": "directive:amd-metadata-context",
+  "actor": "codex",
+  "summary": "Captured clarification: .amd/ stores metadata plus small derived context, not full documents",
+  "detail_json": {
+    "directive_id": "directive:amd-metadata-context",
+    "directive_type": "clarification",
+    "statement": ".amd/ stores metadata plus a small amount of derived context, but never full user-authored documents",
+    "scope": "project",
+    "status": "active"
+  }
 }
 ```
+
+When a directive is later linked to specific artifacts via `amd link`, the resulting `relation_created` and `directive_propagated` records land in the respective target artifacts' journal files.
+
+## End-To-End Pipeline: How The Pieces Fit Together
+
+The six v2 plans each describe one subsystem. This section shows how they combine into a single pipeline during `amd refresh` and normal operation.
+
+### The full flow
+
+```text
+USER'S MARKDOWN FILES (.md)
+        │
+        ▼
+┌─────────────────────────────────────────────────┐
+│  1. PARSE                                       │
+│     markdown-it-py → token stream → AST         │
+│     Owner: markdown-parsing-and-section-identity │
+│     Output: tokens, line map                    │
+│     Lifecycle: EPHEMERAL — discarded after step 2│
+└────────────────────┬────────────────────────────┘
+                     │
+                     ▼
+┌─────────────────────────────────────────────────┐
+│  2. BUILD SECTION TREE + FINGERPRINTS           │
+│     AST → section nodes with stable IDs         │
+│     Content hash + subtree hash per section     │
+│     Owner: markdown-parsing-and-section-identity │
+│     Output: section IDs, fingerprints           │
+│     Lifecycle: IDs and fingerprints PERSIST      │
+│                in cache/index.sqlite             │
+│                AST is DISCARDED here             │
+└────────────────────┬────────────────────────────┘
+                     │
+        ┌────────────┴────────────────────┐
+        │                                 │
+        ▼                                 ▼
+┌──────────────┐              ┌──────────────────┐
+│ 3a. COMPARE  │              │ 3b. UPDATE       │
+│ FINGERPRINTS │              │ GRAPH EDGES      │
+│              │              │                  │
+│ Old vs new   │              │ contains,        │
+│ from sqlite  │              │ derives_from,    │
+│              │              │ revision_of      │
+│ Changed?     │              │ etc.             │
+│ Same?        │              │                  │
+│              │              │ Owner:           │
+│ Owner:       │              │ context-graph-   │
+│ temporal-    │              │ architecture     │
+│ context      │              │ (this plan)      │
+└──────┬───────┘              └──────────────────┘
+       │
+       │ fingerprint changed?
+       │
+       ├─── YES ──────────────────────────┐
+       │                                  │
+       ▼                                  ▼
+┌──────────────────┐           ┌─────────────────────┐
+│ 4a. JOURNAL      │           │ 4b. TEMPORAL STATE  │
+│                  │           │                     │
+│ Append event:    │           │ Write facts:        │
+│ content_changed, │           │ last_changed_at,    │
+│ caveat_expired,  │           │ freshness_anchor_at,│
+│ derivation_drift │           │ caveat/breach/drift │
+│ _entered, etc.   │           │ counts              │
+│                  │           │                     │
+│                  │           │ Read config/:       │
+│ Owner: context-  │           │ stale_after_seconds,│
+│ graph (storage)  │           │ freshness_class     │
+│ + temporal-      │           │                     │
+│ context (types)  │           │ Query-time:         │
+│                  │           │ staleness_ratio,    │
+│ Stored in:       │           │ priority_score      │
+│ .amd/journal/    │           │ (computed via NOW)  │
+│ (APPEND-ONLY)    │           │                     │
+└──────────────────┘           │ Owner: temporal-    │
+                               │ context-handling    │
+                               │                     │
+                               │ Stored in:          │
+                               │ .amd/cache/         │
+                               │ index.sqlite        │
+                               │ (REBUILDABLE)       │
+                               └──────────┬──────────┘
+                                          │
+              ┌───────────────────────────┐│
+              │                           ││
+              ▼                           ▼│
+   ┌─────────────────────┐    ┌──────────────────────┐
+   │ 5. SIGNALS (async)  │    │ 6. EXPORT            │
+   │                     │    │                      │
+   │ External metrics    │    │ amd.xref.json        │
+   │ ingested into       │──► │ per-artifact JSON    │
+   │ sqlite rollups      │    │                      │
+   │                     │    │ Owner: source-format- │
+   │ Owner: temporal-    │    │ and-agent-readable-  │
+   │ context-handling    │    │ surfaces             │
+   │                     │    │                      │
+   │ Raw stored in:      │    │ Stored in:           │
+   │ .amd/signals/       │    │ .amd/export/         │
+   │ (APPEND-ONLY)       │    │ (REBUILDABLE)        │
+   └─────────────────────┘    └──────────┬───────────┘
+                                         │
+                                         ▼
+                              ┌──────────────────────┐
+                              │ 7. CLI COMMANDS      │
+                              │                      │
+                              │ amd prime            │
+                              │ amd agenda           │
+                              │ amd history          │
+                              │ amd query --stale    │
+                              │ amd scan             │
+                              │ amd affected         │
+                              │                      │
+                              │ All read from sqlite │
+                              │ Agents consume these │
+                              └──────────────────────┘
+```
+
+### What is ephemeral versus persisted
+
+| Data | Lifecycle | Where |
+|------|-----------|-------|
+| Raw AST / token stream | Ephemeral — discarded after section tree is built | Memory only |
+| Section IDs | Persisted | `cache/index.sqlite` `sections` table |
+| Content fingerprints | Persisted — needed for next refresh comparison | `cache/index.sqlite` `artifact_locators` + `sections` tables |
+| Subtree fingerprints | Persisted — for Merkle-like drift rollups | `cache/index.sqlite` `sections` table |
+| Per-artifact config | Persisted — source of truth for evaluation parameters | `.amd/config/` YAML files |
+| Activity events | Persisted — append-only, never rewritten | `.amd/journal/` JSONL files |
+| Signal points | Persisted — append-only, never rewritten | `.amd/signals/` JSONL files |
+| Signal rollups | Persisted but rebuildable from raw points | `cache/index.sqlite` `signal_rollups` table |
+| Temporal facts (clocks, counts) | Persisted but rebuildable from journals + signals + config + markdown | `cache/index.sqlite` `artifact_temporal` + `section_temporal` tables |
+| Temporal evaluations (staleness_ratio, priority) | Ephemeral — computed at query time using `unixepoch('now')` | SQL expressions, not stored |
+| Graph edges | Persisted but rebuildable from journals + markdown | `cache/index.sqlite` |
+| Export manifests | Persisted but rebuildable from sqlite | `.amd/export/` JSON files |
+
+### Which plan owns which refresh step
+
+| Refresh step | Owner plan |
+|-------------|------------|
+| 1. Detect missing files and archive absent artifacts | context-graph-architecture + temporal-context-handling |
+| 2. Detect re-appeared files and reclaim archived artifacts | context-graph-architecture + temporal-context-handling |
+| 3. Parse Markdown into tokens and AST | markdown-parsing-and-section-identity |
+| 4. Build section tree and assign stable IDs | markdown-parsing-and-section-identity |
+| 5. Compute content and subtree fingerprints | markdown-parsing-and-section-identity |
+| 6. Resolve artifact identity from frontmatter | source-format-and-agent-readable-surfaces |
+| 7. Resolve temporal policy via 3-layer chain (hardcoded -> config/ -> frontmatter) for each artifact | per-artifact-config + temporal-context-handling |
+| 8. Write resolved freshness_class, stale_after_seconds, and refresh_mode into artifact_temporal | per-artifact-config + context-graph-architecture |
+| 9. Gate per-artifact temporal steps on refresh_mode | temporal-context-handling |
+| 10. Compare fingerprints against previous run | temporal-context-handling |
+| 11. Update temporal clocks (`last_changed_at`, `last_observed_at`) | temporal-context-handling |
+| 12. Validate sections against required_sections from resolved config | per-artifact-config |
+| 13. Update locator table and `contains` edges | context-graph-architecture |
+| 14. Rebuild relation and directive edges from journals | context-graph-architecture |
+| 15. Process new signal points from checkpoints (skip archived, frozen, unforced manual) | temporal-context-handling |
+| 16. Evaluate signal thresholds from resolved config against rollups, update breach/silence counts | temporal-context-handling + per-artifact-config |
+| 17. Recompute caveat lifecycle and freshness_anchor_at (skip archived, frozen, live) | temporal-context-handling |
+| 18. Detect stale state transitions, emit stale_entered/stale_cleared (skip frozen, live, unforced manual) | temporal-context-handling |
+| 19. Read derive contracts from resolved config, detect derivation drift | changes-propagation + per-artifact-config |
+| 20. Append material transition events to journals | context-graph-architecture + temporal-context-handling |
+| 21. Regenerate export manifests | source-format-and-agent-readable-surfaces |
+
+### Key integration rules
+
+1. **The AST never leaves the parser boundary.** Every downstream system works from section IDs, fingerprints, and frontmatter — never from raw tokens.
+2. **Fingerprints are the bridge between parsing and temporal state.** Without them, AMD cannot distinguish "content changed" from "AMD looked at it again."
+3. **Journals are the bridge between temporal events and the rebuildable index.** The index can be deleted and reconstructed from journals + signals + current Markdown.
+4. **Signals enter independently of refresh.** They are ingested from external sources on their own schedule and merged into the temporal state during refresh.
+5. **Temporal policy resolves via the 3-layer chain.** AMD resolves `freshness_class`, `stale_after`, and `refresh_mode` through hardcoded defaults -> `.amd/config/<artifact_id>.yml` -> frontmatter `amd.policy`. Signal thresholds, derive contracts, and required sections come from the same resolution. Resolved values are written into `artifact_temporal` in SQLite so queries can use them without re-reading YAML. Section validation (`amd doctor`) compares `required_sections` from config against the section tree already in SQLite — no separate schema system needed.
+6. **Export is the last step.** It snapshots current sqlite state into static JSON for fast agent bootstrap. It is always rebuildable.
 
 ## Explicit Beats Heuristic
 
@@ -627,6 +1087,35 @@ Instead:
 - agents consume the graph, not filenames
 
 That is the right scope for AMD.
+
+## Doctor Checks For Graph Integrity
+
+`amd doctor` should validate graph-level consistency. These checks run against the index, not by reparsing Markdown.
+
+| Check | Severity | Description |
+|---|---|---|
+| Active artifact, missing file | ERROR | Artifact in index with `state: active` but source file does not exist at `current_path`. Suggests running `amd refresh` to detect and archive. |
+| Live edge to archived artifact | ERROR | Edge with `ended_at = null` pointing at an artifact with `state: archived`. Indicates archival cascade did not complete. |
+| Orphaned signal file | WARNING | Signal file in `.amd/signals/` with no corresponding artifact in index. Historical data — not harmful, but should be flagged. |
+| Directive with all targets archived | WARNING | Directive with `status: active` but every `reflected_in` edge is ended. The directive may be stale or need revocation. |
+| Missing archival cascade | ERROR | Derivation edge where source is archived but downstream target has no `derivation_drift_entered` activity and no caveat referencing the archived source. |
+| Dangling section edge | WARNING | Edge targeting a section ID that no longer exists in any current artifact's section tree. Expected after section removal; flagged for cleanup awareness. |
+
+## Reindex Behavior With Missing Artifacts
+
+When `amd reindex` rebuilds the index from scratch:
+
+1. Scan configured Markdown roots for current files.
+2. Replay all journal entries to reconstruct activity history, edges, and directives.
+3. For artifacts referenced in journals but with no current source file:
+   - create an artifact record in the index with `state: archived` and `reason: file_missing`
+   - set `ended_at` on all edges involving that artifact
+4. For signal files in `.amd/signals/` with no matching artifact in the index:
+   - keep the signal files (they are historical data, not garbage)
+   - create an archived artifact stub in the index so rollups and history remain queryable
+5. Validate all edges: any edge referencing an archived artifact should have `ended_at` set.
+
+This ensures reindex produces the same result as a fresh start followed by incremental refreshes — no orphaned state, no dangling edges, and full history preserved.
 
 ## Recommendation
 

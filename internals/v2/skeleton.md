@@ -9,6 +9,8 @@ Each feature states: what it is, why it matters, what v1 has, and how v2 achieve
 
 **AMD is an agent-native CLI.** The primary consumers are AI agents — Claude Code, Codex, and similar — that invoke AMD commands at machine speed and volume. Agents dynamically create artifacts, record events, query the graph, derive new documents, and break/rebuild structure as understanding evolves. The graph in `.amd/` is live working state that changes every session. Humans can use the CLI directly, but the design optimizes for programmatic agent consumption.
 
+**AMD has two layers of types: core types and per-artifact config.** Core types are internal data contracts defined in AMD's own source code (Pydantic models). They govern how AMD's journal, signal, index, and temporal systems operate. Examples: `JournalRecord`, `SignalPoint`, `SignalRollup`, `ArtifactTemporalState`, `SectionTemporalState`. Per-artifact config files live in `.amd/config/<artifact_id>.yml` and vary per project — they hold operational parameters like freshness policy, signal definitions, derive contracts, and required sections. Artifact frontmatter carries local one-off overrides. The same core/agent split that applies to behavior (core computes, agents decide) applies to types: core types are the fixed machinery, per-artifact config is the project-specific semantics that ride on top. Within core types, JSONL-backed records (`JournalRecord`, `SignalPoint`) have a further split: a thin mandatory core envelope (fields AMD needs for computation) and a flexible agent/user context layer (fields the agent shapes per domain). Core reads the envelope and stores the rest faithfully without validating it. Derived types like `SignalRollup` and `ArtifactTemporalState` are entirely core-owned — computed by core, read by agents.
+
 ---
 
 ## F1. Source Format: Plain Markdown With Minimal Frontmatter
@@ -49,7 +51,7 @@ amd:
 
 ### What Stays In The File
 - Identity (id, kind, title, labels)
-- Policy overrides (only if different from project/schema defaults)
+- Policy overrides (only if different from config/ defaults)
 - Derive declarations (only if this artifact has derivation outputs)
 - Section label comments in the body
 - Optionally: materialized projection blocks (generated, clearly marked)
@@ -99,9 +101,10 @@ V1 has no project config. Every artifact carries its own full metadata. Policy l
 - Nothing. All defaults are hardcoded in `core.py`.
 
 ### V2 Approach
-- `.amd/config.yml` holds project defaults.
-- Policy resolution order: section override > artifact frontmatter > schema default > project config.
-- Explicit `null` in frontmatter means "clear the inherited value."
+- Per-artifact config in `.amd/config/<artifact_id>.yml` holds operational parameters.
+- Policy resolution order: artifact frontmatter > per-artifact config/ > AMD hardcoded defaults.
+- Explicit `null` in frontmatter means "clear the inherited value back to hardcoded default."
+- No global config file. No schemas. Hardcode what doesn't need tuning in v2.
 
 ### Config Shape
 
@@ -130,29 +133,31 @@ hooks:
 
 ---
 
-## F4. Schema System
+## F4. Per-Artifact Config And Section Validation
 
 ### Goal
-Artifact kinds should be schema-driven: define required/optional sections, default policy, template binding, and derivation rules.
+Each artifact's operational parameters — freshness policy, required sections, signal definitions, derive contracts — should live in a per-artifact config file. Section validation uses the section tree already in SQLite.
 
 ### Why
-V1 has four hardcoded kinds in `templates.py` with no validation, no required sections, and no connection between kind and policy. The scaffold borrows Dendron's schema-as-type-system model.
+V1 has four hardcoded kinds in `templates.py` with no validation, no required sections, and no connection between kind and policy. The original v2 scaffold proposed a schema-as-type-system model, but per-artifact config plus SQLite covers everything schemas would have done without a separate subsystem.
 
 ### What V1 Has
 - `templates.py` with four render functions: `render_task_template`, `render_report_template`, `render_mental_model_template`, `render_skill_derived_template`.
 - Kind is a string field in metadata. No enforcement.
 
 ### V2 Approach
-- Schema files live in `.amd/schemas/*.yml`.
-- A schema defines: kind ID, parent/namespace, required sections, optional sections, default policy, template path, derivation outputs.
-- `amd init --kind report.incident` uses the schema to select template, inject sections, and set policy.
-- Validation: `amd doctor` checks artifacts against their schema.
+- Per-artifact config files live in `.amd/config/<artifact_id>.yml`.
+- Config defines: kind, freshness policy, required/optional sections, signal definitions, derive contracts.
+- `amd init --kind report.incident` — the agent seeds the config file with kind-appropriate values.
+- Validation: `amd doctor` compares `required_sections` from config/ against the section tree in SQLite.
+- No separate schema files. No global config.
 
-### Schema Shape
+### Config Shape
 
 ```yaml
-id: report.incident
-parent: report
+kind: report.incident
+freshness_class: observational
+stale_after: 4h
 required_sections:
   - executive-summary
   - current-context
@@ -161,13 +166,12 @@ required_sections:
 optional_sections:
   - timeline
   - appendices
-template: templates/report.incident.md
-policy:
-  freshness_class: observational
-  stale_after: 4h
 derive:
-  outputs:
-    - skill.oncall
+  targets:
+    report.postmortem:
+      mappings:
+        - from: executive-summary
+          to: incident-summary
 ```
 
 ---
@@ -191,36 +195,35 @@ V1 appends timeline entries directly into the Markdown body between `<!-- amd:ti
   ```
   .amd/
     journal/
-      events/
-        2026-03.jsonl
-      caveats/
-        2026-03.jsonl
-      derivations/
-        2026-03.jsonl
+      <artifact_id>.jsonl     # JournalRecords, per-artifact
+      _project.jsonl          # Project-level records (e.g. refresh_run)
     signals/
-      <artifact_id>.jsonl
+      <artifact_id>.jsonl     # SignalPoint records, per-artifact
   ```
 - Journals are git-tracked.
 - Journals use `merge=union` in `.gitattributes` for safe cross-branch merges.
 - The inline Markdown timeline becomes a materialized projection from journal data, not the source of truth.
 
-### Event Shape
+### JournalRecord Shape
 
 ```json
 {
-  "id": "evt_...",
-  "timestamp": "2026-03-11T12:00:00Z",
-  "activity": "derive",
-  "agent": "codex",
+  "activity_id": "act_01",
+  "activity_type": "derivation_updated",
   "artifact_id": "skill.payments.oncall",
-  "section_id": "workflow",
+  "occurred_at": "2026-03-11T12:00:00Z",
+  "recorded_at": "2026-03-11T12:00:01Z",
+  "actor": "codex",
   "summary": "Re-derived workflow from latest mental model",
-  "details": {
+  "detail_json": {
     "source_artifact_id": "mental_model.payments.authorization",
-    "changed_labels": ["decision-rules", "failure-modes"]
+    "source_section_ids": ["decision-rules", "failure-modes"],
+    "target_section_ids": ["workflow"]
   }
 }
 ```
+
+The first five fields (`activity_id` through `recorded_at`) are the core envelope — AMD core requires these. Everything else is agent/user context — core stores it but does not validate or interpret it. See the temporal-context-handling plan for the full `JournalRecord` spec and activity type reference.
 
 ### What V1's Timeseries Sidecar Becomes
 - V1's `.amd/data/<id>.jsonl` moves to `.amd/signals/<id>.jsonl`.
@@ -350,7 +353,7 @@ V1 caveats are objects in the inline JSON metadata — they work, but they have 
 - Active count feeds priority (+5 each, max +20).
 
 ### V2 Approach
-- Caveats move to the journal: `.amd/journal/caveats/`.
+- Caveats are recorded as `JournalRecord` entries (activity types `caveat_added`, `caveat_mitigated`, `caveat_expired`) in the single journal stream `.amd/journal/`.
 - Indexed in SQLite for query.
 - Fields:
   - `id`, `applies_to` (artifact / section / derivation / signal)
@@ -426,7 +429,7 @@ V1 rewrites the entire Markdown file on every operation (`save_document` writes 
 |-------|----------|
 | Read-only | `scan`, `query`, `prime`, `export`, `agenda` |
 | Locked write | `event`, `caveat`, `signal`, `derive`, `recompute`, `materialize`, `refresh` |
-| Serialized setup | `init`, `schema add`, `config edit` |
+| Serialized setup | `init`, `config edit` |
 
 ---
 
@@ -445,7 +448,7 @@ V1 tracks `agents.contributors` and `agents.last_actor` in metadata, and timelin
 
 ### V2 Approach
 
-**Entities**: artifact, section, generated block, signal window, template, schema.
+**Entities**: artifact, section, generated block, signal window, template.
 
 **Activities**: init, refresh, recompute, materialize, derive, caveat.create, caveat.resolve, signal.ingest, policy.evaluate.
 
@@ -470,7 +473,7 @@ Declared, reproducible transforms between artifacts with provenance and ownershi
 V1's `derive_skill_artifact()` is a copy operation: it extracts specific sections from a mental model and pastes them into a skill template. No transform spec, no provenance edges, no way to re-derive without clobbering user edits. The scaffold calls this out as too weak.
 
 ### V2 Approach
-- Derivation rules declared in schema or artifact frontmatter.
+- Derivation rules declared in per-artifact config/ or artifact frontmatter.
 - Inputs are labeled source sections.
 - Transform spec describes what to extract, how to restructure.
 - Output sections are marked as `generated` (machine-owned) vs `user` (human-owned).
@@ -520,7 +523,7 @@ V1 rewrites the entire file on every operation. There is no concept of which sec
 - Ownership categories: `user`, `agent`, `generated`, `mixed`.
 - AMD auto-updates only: generated projections, generated blocks, index/journal state.
 - Agent-suggested edits to user-owned sections must be explicit (not silent rewrites).
-- Schema can declare section ownership defaults.
+- Per-artifact config/ can declare section ownership defaults.
 
 ---
 
@@ -550,7 +553,7 @@ V1 has 9 commands that mostly do the right thing but blur the line between index
 
 | Command | Semantics | Safety Class |
 |---------|-----------|-------------|
-| `init` | Create artifact from schema/template | Setup |
+| `init` | Create artifact from template, seed config/ | Setup |
 | `refresh` | Parse, fingerprint, update index. Does NOT rewrite Markdown. | Locked write |
 | `recompute` | Expensive derivation or signal-rollup work | Locked write |
 | `materialize` | Write projections into Markdown | Locked write |
@@ -563,7 +566,7 @@ V1 has 9 commands that mostly do the right thing but blur the line between index
 | `agenda` | Priority-ranked work queue | Read-only |
 | `prime` | Emit agent-facing context pack | Read-only |
 | `export` | Write machine-readable JSON manifests | Read-only |
-| `doctor` | Validate journals, schemas, labels, projections | Read-only |
+| `doctor` | Validate journals, required sections, labels, projections | Read-only |
 | `reindex` | Rebuild SQLite from source + journals | Setup |
 
 ### Key Behavioral Changes From V1
@@ -637,28 +640,22 @@ AMD should be automation-friendly without becoming an automation platform. The s
 ```
 project-root/
   .amd/                                   # Metadata only — zero document content
-    config.yml                          # Project defaults, kind overrides, hooks
-    schemas/
-      report.incident.yml               # Schema definitions
-      mental_model.yml
+    config/
+      report.payments.incident.yml      # Per-artifact operational config
+      mental_model.payments.yml
     journal/
-      events/
-        2026-03.jsonl                   # Append-only event records
-      caveats/
-        2026-03.jsonl                   # Append-only caveat records
-      derivations/
-        2026-03.jsonl                   # Append-only derivation records
+      report.payments.incident.jsonl    # Per-artifact JournalRecords
+      mental_model.payments.jsonl
+      _project.jsonl                    # Project-level records (refresh_run, etc.)
     signals/
-      report.payments.incident.jsonl    # Per-artifact signal timeseries
+      report.payments.incident.jsonl    # Per-artifact SignalPoint timeseries
+      mental_model.payments.jsonl
     cache/
       index.sqlite                      # Rebuildable local index (gitignored)
     export/
       amd.xref.json                     # Site manifest
       artifacts/
         <artifact_id>.json              # Per-artifact detail
-    templates/
-      report.incident.md                # Template files
-      mental_model.md
   artifacts/
     report.payments.incident.md         # Normal Markdown with AMD frontmatter
     mental_model.payments.md
@@ -676,11 +673,11 @@ project-root/
 | `.amd/data/*.jsonl` signals | `.amd/signals/*.jsonl` (same shape, new location) |
 | Raw SHA256 section hashes | AST-aware structural fingerprints |
 | `stale_after_hours` per section | Freshness classes + policy inheritance |
-| Hardcoded template functions | Schema-bound templates in `.amd/schemas/` + `.amd/templates/` |
+| Hardcoded template functions | Per-artifact config in `.amd/config/` with required sections, policy, derive contracts |
 | `scan` by reparsing files | `scan` from SQLite index |
 | `derive-skill` copy operation | `derive` with declared transforms + provenance |
 | `save_document()` full rewrite | Atomic writes with lock files |
-| No project config | `.amd/config.yml` with inheritance |
+| No project config | Per-artifact `.amd/config/<artifact_id>.yml` + hardcoded defaults |
 
 ---
 
@@ -706,9 +703,8 @@ project-root/
 - Ownership boundaries
 - Exit: concurrent write stress test passes
 
-### Phase 3: Schemas And Derivation
-- Schema registry
-- Required/optional sections
+### Phase 3: Config And Derivation
+- Per-artifact config with required/optional sections
 - Template binding
 - Derivation rules with provenance
 - Generated block ownership

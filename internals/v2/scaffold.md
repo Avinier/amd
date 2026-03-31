@@ -200,12 +200,12 @@ Obsidian templates support variable expansion and merge properties into the dest
 **AMD borrow**
 
 - Template ergonomics matter.
-- Schema-bound templates should inject the right fields/sections automatically.
+- Templates should inject the right fields/sections automatically based on kind.
 
 **Implementation implication**
 
 - `amd init --kind report.incident` should not ask the user to pick from random templates.
-- The schema should choose the template.
+- The agent seeds config/ with required sections and policy for the kind.
 - Template variables should include title, date, actor, project defaults, and label stubs.
 
 #### Signal: views, filters, formulas, summaries
@@ -319,26 +319,24 @@ Quarto supports project `pre-render` and `post-render` scripts and provides envi
 
 ### 4. Dendron
 
-#### Signal: schemas and templates as a type system for notes
+#### Signal: kind-driven artifact creation
 
 Dendron explicitly frames schemas and templates as a type system for general knowledge.[17]
 
 **AMD borrow**
 
-- Artifact kinds should be schema-driven, not just template-named.
+- Artifact kinds should be config-driven, not just template-named.
 - Templates should be attached to kind definitions, not chosen independently.
 
 **Implementation implication**
 
-- Create schema files in `.amd/schemas/*.yml`.
-- A schema should define:
+- Per-artifact config files in `.amd/config/<artifact_id>.yml` define:
   - kind ID
-  - allowed parent/namespace
   - required sections
   - optional sections
-  - default policy
-  - applicable templates
-  - derivation rules
+  - freshness policy
+  - signal definitions
+  - derivation contracts
 
 #### Signal: namespace-based organization and hierarchy
 
@@ -356,17 +354,17 @@ Dendron schemas use IDs, patterns, parents, children, and `namespace: true` to d
   - `skill.payments.oncall`
 - Inference: namespace-based IDs are more robust query keys than path-only identity.
 
-#### Signal: schema-bound template injection
+#### Signal: kind-driven template injection
 
 Dendron schema docs support template application when notes match a schema pattern.[18]
 
 **AMD borrow**
 
-- `amd init` should be deterministic from schema.
+- `amd init` should be deterministic from the kind.
 
 **Implementation implication**
 
-- `amd init --kind mental_model.payments` should always inject the same scaffold unless the schema says otherwise.
+- `amd init --kind mental_model.payments` should always inject the same scaffold — the agent seeds config/ with the kind's required sections and policy.
 - No extra user choice is needed for the happy path.
 
 #### Signal: ideas good, product not safe as a hard dependency
@@ -404,10 +402,9 @@ Org property inheritance allows parent properties to flow downward; `nil` explic
 **Implementation implication**
 
 - Policy resolution order:
-  1. section override
-  2. artifact frontmatter
-  3. schema default
-  4. project config
+  1. artifact frontmatter
+  2. per-artifact config/
+  3. AMD hardcoded defaults
 
 #### Signal: LOGBOOK-style timestamped state change notes
 
@@ -492,7 +489,7 @@ Mulch distinguishes read-only commands, locked-write commands, and serialized se
 - AMD command classes:
   - read-only: `scan`, `query`, `prime`, `export`
   - locked writes: `event`, `caveat`, `signal`, `derive`, `recompute`, `materialize`
-  - setup ops: `init`, `schema add`, `config edit`, `hook install`
+  - setup ops: `init`, `config edit`, `hook install`
 
 ## Foundational Standards And Literature
 
@@ -561,7 +558,7 @@ W3C PROV-DM defines provenance in terms of entities, activities, and agents, plu
   - artifact or section = entity
   - refresh / derive / recompute / signal-ingest = activity
   - user / model / tool / automation = agent
-  - template / schema / transform plan = plan
+  - template / transform plan = plan
 
 ### 5. Concurrency beyond ad hoc merge behavior
 
@@ -683,17 +680,13 @@ Suggested layout:
 
 ```text
 .amd/
-  config.yml
-  schemas/
+  config/
+    report.payments.incident-2026-03-11.yml   # Per-artifact config
   journal/
-    events/
-      2026-03.jsonl
-    caveats/
-      2026-03.jsonl
-    derivations/
-      2026-03.jsonl
+    report.payments.incident-2026-03-11.jsonl   # Per-artifact JournalRecords
+    _project.jsonl                               # Project-level records
   signals/
-    report.payments.incident-2026-03-11.jsonl
+    report.payments.incident-2026-03-11.jsonl   # Per-artifact SignalPoints
   cache/
     index.sqlite
   export/
@@ -761,7 +754,7 @@ AMD should adopt a PROV-like internal vocabulary.[26]
 - generated block
 - signal window
 - template
-- schema
+
 
 ### Activities
 
@@ -799,18 +792,18 @@ This lets AMD answer questions like:
 - What signal or caveat caused this artifact's priority to jump?
 - Was this summary refreshed or only materialized from cached results?
 
-## Schema And Template System
+## Per-Artifact Config And Template System
 
-### Schema shape
+### Config shape
 
-AMD schemas should borrow from Dendron's YAML schema model.[17][18]
+Per-artifact config files hold operational parameters and structural expectations. Borrowing the kind-driven creation idea from Dendron,[17][18] but using per-artifact config instead of a separate schema subsystem.
 
-Suggested schema fields:
+Suggested config fields:
 
 ```yaml
-id: report.incident.payments
-parent: report.incident
-namespace: false
+kind: report.incident
+freshness_class: observational
+stale_after: 4h
 required_sections:
   - executive-summary
   - current-context
@@ -819,18 +812,17 @@ required_sections:
 optional_sections:
   - timeline
   - appendices
-template: templates/report.incident.md
-policy:
-  freshness_class: observational
-  stale_after: 4h
 derive:
-  outputs:
-    - skill.oncall.payments
+  targets:
+    report.postmortem:
+      mappings:
+        - from: executive-summary
+          to: incident-summary
 ```
 
 ### Template rules
 
-- Templates are chosen by schema, not by user whim.
+- Templates are chosen by kind, not by user whim.
 - Templates may contain label stubs.
 - Templates may contain generated-block placeholders.
 - Templates may contain policy hints, but those are resolved in config/index, not trusted as final truth.
@@ -1177,7 +1169,7 @@ Borrow directly from Mulch's documented safety model for append-heavy multi-agen
   - `materialize`
 - serialized setup:
   - `init`
-  - `schema add`
+
   - `hook install`
   - `config edit`
 
@@ -1250,7 +1242,7 @@ Suggested v2 command model:
 - `materialize`: write projections into Markdown
 - `derive`: perform declared transforms between artifacts
 - `prime`: emit agent-facing context pack from the index
-- `doctor`: validate journals, schemas, labels, and projections
+- `doctor`: validate journals, required sections, labels, and projections
 
 ## Prime / Context Delivery
 
@@ -1387,7 +1379,7 @@ Exit criteria:
 
 - concurrent write stress test passes
 
-### Phase 3: Schema and derivation system
+### Phase 3: Config and derivation system
 
 Goal:
 
@@ -1395,8 +1387,7 @@ Goal:
 
 Work:
 
-- schema registry
-- required sections
+- per-artifact config with required sections
 - template binding
 - derivation rules
 - generated block ownership
@@ -1505,7 +1496,7 @@ Markdown/MyST-compatible source
 + rebuildable local index
 + structural fingerprints
 + provenance model
-+ schema-bound derivation
++ config-driven derivation
 + Quarto-style refresh modes and hooks
 = AMD
 ```
@@ -1515,7 +1506,7 @@ The highest-value borrowings are:
 1. MyST's AST/labels/machine-readable index model.[1][2][3][5][6][7]
 2. Mulch's write safety, classification tiers, and storage-vs-delivery discipline.[22]
 3. Quarto's refresh/recompute split and hook model.[15][16]
-4. Dendron's schema-bound creation model.[17][18]
+4. Dendron's kind-driven creation model.[17][18]
 5. Org's inheritance and LOGBOOK-like audit ideas.[20][21]
 6. PROV's entity/activity/agent model for traceability.[26]
 7. Structured-diff literature instead of raw hashes.[23][24][25]

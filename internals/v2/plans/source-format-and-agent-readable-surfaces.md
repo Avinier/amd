@@ -100,7 +100,7 @@ Pros:
 
 - dominant convention across Markdown publishing/documentation systems[1][2][3][4][5]
 - good human readability
-- natural nested structure for `amd.policy`, `amd.derive`, and labels
+- natural nested structure for `amd.policy` and labels
 - easy to preserve in plain `.md`
 - familiar to technical users and agents alike
 
@@ -187,7 +187,7 @@ Use a hybrid frontmatter model:
 - **top-level keys** for generic document metadata that other tools may understand
 - **`amd:` namespace** for AMD-specific metadata
 
-Recommended example:
+Recommended typical example (minimal — config/ handles policy):
 
 ```yaml
 ---
@@ -198,13 +198,19 @@ amd:
   kind: report.incident
   labels:
     team: payments
+---
+```
+
+Recommended override example (rare — only when this instance is temporarily different from its config/):
+
+```yaml
+---
+title: Payments Incident Report — Critical
+amd:
+  id: report.payments.incident-2026-03-11
+  kind: report.incident
   policy:
-    freshness_class: observational
-    stale_after: 4h
-    refresh_mode: auto
-  derive:
-    outputs:
-      - report.postmortem
+    stale_after: 2h
 ---
 ```
 
@@ -224,13 +230,15 @@ because `title` is a generic document concept, not AMD-specific state.
 
 - generic page metadata like `title`, optionally `date`
 - `amd.id`
-- `amd.kind`
+- `amd.kind` (informational — must match config/ if present)
 - `amd.labels`
-- `amd.policy` overrides only
-- `amd.derive` declarations only when needed
+- `amd.policy` rare one-off overrides only (normal policy lives in `.amd/config/`)
 
 #### What should not stay in source frontmatter
 
+- derive contracts (canonical home is `.amd/config/` per the config plan)
+- signal definitions and thresholds (canonical home is `.amd/config/`)
+- required section lists (canonical home is kind definitions or `.amd/config/`)
 - computed freshness state
 - priority score
 - signal rollups
@@ -330,18 +338,21 @@ JSON Lines explicitly recommends a newline terminator after each value and `.jso
 Use JSON Schema for:
 
 - parsed frontmatter validation
+- parsed per-artifact config validation (`.amd/config/<artifact_id>.yml` — the canonical operational policy source)
+- parsed `kinds.yml` validation
 - export contract validation
 - CLI JSON output contract tests
 
 Why:
 
-- YAML frontmatter can be parsed into ordinary data
+- YAML frontmatter and config files can both be parsed into ordinary data
 - JSON Schema is built for structural validation[9][10]
 - GitHub Docs uses schema-based validation for frontmatter in its test suite, which is a strong real-world precedent.[4]
+- per-artifact config is canonical operational input that AMD reads on every refresh — it needs the same validation rigor as frontmatter and exports
 
 Practical rule:
 
-- author in YAML
+- author in YAML (frontmatter, config/, kinds.yml)
 - parse to data
 - validate as JSON using JSON Schema
 
@@ -419,7 +430,7 @@ The right split is:
   - decides how to populate the canonical shape for a particular artifact
   - infers `kind`, policy overrides, and labels when needed
   - preserves unrelated user metadata
-  - avoids writing unnecessary fields when schema/config defaults already cover the case
+  - avoids writing unnecessary fields when config/ defaults already cover the case
 
 Short rule:
 
@@ -428,7 +439,7 @@ Short rule:
 
 #### What the agent should actively do
 
-1. Prefer schema/project defaults over explicit frontmatter overrides.
+1. Prefer config/ defaults over explicit frontmatter overrides.
 2. Only write AMD metadata that is actually needed for this artifact.
 3. Infer `kind` and minimal `amd.policy` overrides from the document’s purpose.
 4. Keep generic document metadata such as `title` at top level when present.
